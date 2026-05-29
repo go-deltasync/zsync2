@@ -1,0 +1,115 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: amd64, ext: tar.gz }
+          - { os: linux,   arch: arm64, ext: tar.gz }
+          - { os: darwin,  arch: amd64, ext: tar.gz }
+          - { os: darwin,  arch: arm64, ext: tar.gz }
+          - { os: windows, arch: amd64, ext: zip    }
+          - { os: windows, arch: arm64, ext: zip    }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          check-latest: true
+
+      - name: Determine version
+        id: ver
+        run: |
+          ref="${GITHUB_REF##*/}"
+          ver="${ref#v}"
+          echo "tag=$ref"  >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          mkdir -p dist
+          stage="dist/zsync2-${{ steps.ver.outputs.tag }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "$stage"
+          exe=""
+          if [ "${{ matrix.os }}" = "windows" ]; then exe=".exe"; fi
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -o "$stage/gozsync$exe" ./cmd/gozsync
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -o "$stage/gozsyncmake$exe" ./cmd/gozsyncmake
+          cp LICENSE README.md "$stage/"
+
+      - name: Package archive
+        id: pack
+        run: |
+          set -eu
+          stage="dist/zsync2-${{ steps.ver.outputs.tag }}-${{ matrix.os }}-${{ matrix.arch }}"
+          base=$(basename "$stage")
+          out="dist/${base}.${{ matrix.ext }}"
+          if [ "${{ matrix.ext }}" = "zip" ]; then
+            (cd dist && zip -r "${base}.zip" "$base")
+          else
+            tar -C dist -czf "$out" "$base"
+          fi
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+          sha256sum "$out" > "${out}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zsync2-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            ${{ steps.pack.outputs.path }}
+            ${{ steps.pack.outputs.path }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect into one dist/ + SHA256SUMS
+        run: |
+          set -eu
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec cp -v {} dist/ \;
+          (cd dist && sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS || true)
+          cat dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
