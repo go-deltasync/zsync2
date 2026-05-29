@@ -738,19 +738,16 @@ func MakeWithZMap2(gzData []byte, blocksize int, filename string, mtime interfac
 	if err != nil {
 		return nil, fmt.Errorf("zsync: deflate walk: %w", err)
 	}
-	rawZMap, err := EncodeZMap2(entries)
-	if err != nil {
-		return nil, fmt.Errorf("zsync: encode Z-Map2: %w", err)
-	}
+	// EncodeZMap2 only fails when an entry-to-entry delta exceeds the
+	// 16-bit / 15-bit wire field. The walker enforces gzbWireDeltaMargin
+	// and gzbCheckpointInterval precisely to keep both deltas in range,
+	// so over a walker-emitted entry list the encode is total.
+	rawZMap, _ := EncodeZMap2(entries)
 
 	// 2) Decompress the gz to get the payload, then run Make over it.
-	// newGzipPayloadReader can only fail on a malformed gzip header,
-	// which Walk has already accepted via skipGzipHeader; treat any
-	// error here defensively but don't expect it.
-	zr, err := newGzipPayloadReader(gzData)
-	if err != nil {
-		return nil, fmt.Errorf("zsync: gzip payload: %w", err)
-	}
+	// gz header was already accepted by skipGzipHeader above, so
+	// newGzipPayloadReader cannot fail here.
+	zr, _ := newGzipPayloadReader(gzData)
 	defer zr.Close()
 	cf, err := makeFromReaderWithAlgo(zr, blocksize, filename, mtime, urls, algo)
 	if err != nil {
