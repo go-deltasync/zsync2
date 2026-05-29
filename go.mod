@@ -1,4 +1,4 @@
-module github.com/tannevaled/go-zsync
+module github.com/go-deltasync/zsync2
 
 go 1.22
 

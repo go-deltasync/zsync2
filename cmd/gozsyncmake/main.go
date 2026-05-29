@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/tannevaled/go-zsync/internal/zsync"
+	"github.com/go-deltasync/zsync2/internal/zsync"
 )
 
 func main() {
