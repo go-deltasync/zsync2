@@ -379,6 +379,39 @@ func TestNumBlocksZeroBlocksize(t *testing.T) {
 	}
 }
 
+// TestReadRejectsZMap2OnZsync2File — Z-Map2 on a zsync2 control file is
+// intentionally unsupported (BLAKE3 + gzip random-access interaction is
+// unspecified). The parser must reject it loudly.
+func TestReadRejectsZMap2OnZsync2File(t *testing.T) {
+	body := []byte("zsync2: 1.0\nBlocksize: 2048\nLength: 2048\nHash-Lengths: 1,2,16\nZ-Map2: 1\n")
+	body = append(body, make([]byte, 4)...) // 4 raw bytes for the one entry
+	body = append(body, []byte("URL: /x\n\n")...)
+	body = append(body, make([]byte, 18)...) // 1 block * (2+16)
+	if _, err := Read(bytes.NewReader(body)); err == nil {
+		t.Fatal("expected rejection of Z-Map2 on zsync2 file")
+	}
+}
+
+// TestWriteEmitsRecompress — the Recompress header is emitted when set.
+func TestWriteEmitsRecompress(t *testing.T) {
+	cf := &ControlFile{
+		Blocksize:   1024,
+		Length:      1024,
+		HashLengths: HashLengths{1, 2, 3},
+		URLs:        []string{"x"},
+		SHA1Hex:     "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+		Recompress:  "--best",
+		Blocks:      []BlockChecksum{{Checksum: []byte{0, 0, 0}}},
+	}
+	var buf bytes.Buffer
+	if err := cf.Write(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "Recompress: --best") {
+		t.Errorf("Recompress missing: %s", buf.String())
+	}
+}
+
 // errAfterReader returns `n` bytes of data then `err` on the next read.
 type errAfterReader struct {
 	n   int
