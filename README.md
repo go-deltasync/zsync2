@@ -268,23 +268,29 @@ in-tree `gozsync` client reads both formats transparently.
 ## Project scope and known gaps
 
 The current release covers the uncompressed path of the zsync protocol in
-full. Intentionally not implemented:
+full and the Z-Map2 maker (gzip-compressed-target path) at least
+server-side. What's still missing:
 
-- **`Z-Map2` / `Recompress`.** This is the path where the target is
-  served gzip-compressed and the `.zsync` indexes the *uncompressed*
-  stream so the client can reuse a previous gzip copy. The maker doesn't
-  emit `Z-Map2` and the client errors out cleanly if it encounters one.
-- **`seq_matches == 2` filtering.** We parse `.zsync` files that declare
-  `seq_matches == 2` (the default for files larger than one block) and
-  match correctly; we simply skip the "next block must also match"
-  optimisation and rely on MD4 to filter out the extra weak-checksum
-  hits. Throughput is fine for typical AppImage-sized targets; truly huge
-  files will see more MD4 work than the C reference.
-- **`multipart/byteranges` batching.** We issue one HTTP `GET` per
-  contiguous run of missing blocks. A `parseMultipartByteRanges` helper
-  is in place for when we want to batch.
-- **Multi-URL failover, resumable on-disk staging, RFC 822 `MTime`
-  preservation on the output file, conditional GET.**
+- **Client-side Z-Map2 fetch.** The maker emits `Z-URL:` + `Z-Map2:`
+  headers via `gozsyncmake --z-map` (or auto on `.gz` input); the client
+  parses them and exposes a parsed `cf.ZMap` table; but the actual
+  "fetch the gz by HTTP byte range, reset the decompressor at a Z-Map2
+  restart point, decompress just enough bytes to cover the missing
+  range" plumbing is not wired into `gozsync` yet. A client running
+  against a Z-Map2 `.zsync` whose `URL:` points at a gz endpoint will
+  download the gz whole-file via the URL fallback.
+- **`Recompress`.** The header round-trips through `Write` but the
+  client never acts on it.
+- **BLAKE3 + Z-Map2.** The proposal intentionally leaves the wire
+  interaction unspecified; the parser rejects the combination loudly
+  and the maker refuses `--z-map --format=zsync2`.
+
+Everything else from the original "known gaps" list has landed in this
+release: `seq_matches == 2` filtering (a ~2x throughput win on noisy
+seeds), multipart/byteranges batching, multi-URL failover, RFC 822
+MTime preservation, conditional GET (`If-Modified-Since:` on the
+`.zsync` GET), and resumable on-disk staging (`<output>.partial` is
+reused as a seed on the next invocation).
 
 ## Contributing
 
