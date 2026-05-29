@@ -84,6 +84,12 @@ func (m *Matcher) TotalBlocks() int { return len(m.got) }
 // block's stored MD4 prefix.
 func (m *Matcher) FeedSeed(r io.Reader) error {
 	bs := m.blocksize
+	// Nothing to match against (empty target file): drain the seed and
+	// return without doing any work.
+	if m.cf.NumBlocks() == 0 || bs <= 0 {
+		_, err := io.Copy(io.Discard, r)
+		return err
+	}
 	// Read entire seed into memory. For very large seeds we'd want to
 	// stream with a ring buffer, but for an MVP this is fine and simpler
 	// to reason about.
@@ -91,9 +97,18 @@ func (m *Matcher) FeedSeed(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if len(seed) < bs {
-		// Pad short seed so we at least try one window.
-		pad := make([]byte, bs)
+	// Round the seed up to at least one full blocksize and align the tail to a
+	// blocksize boundary. The C reference's make.c zero-pads the last short
+	// block of the *target* before computing its rsum/MD4, so a seed that
+	// also ends with a partial block needs the same zero-padding here for the
+	// rolling search to land on the natural tail-block window.
+	needed := bs
+	if len(seed) > bs {
+		// smallest multiple of bs that is >= len(seed)
+		needed = ((len(seed) + bs - 1) / bs) * bs
+	}
+	if needed > len(seed) {
+		pad := make([]byte, needed)
 		copy(pad, seed)
 		seed = pad
 	}
@@ -102,9 +117,6 @@ func (m *Matcher) FeedSeed(r io.Reader) error {
 	x := 0
 	for {
 		end := x + bs
-		if end > len(seed) {
-			break
-		}
 		// Lookup
 		h := m.hashRsum(r0)
 		if cands, ok := m.table[h]; ok {
@@ -142,10 +154,9 @@ func (m *Matcher) acceptBlock(idx int, data []byte) {
 	off := int64(idx) * int64(bs)
 	n := int64(bs)
 	if off+n > m.cf.Length {
+		// Short last block: only the live bytes go into the output buffer;
+		// the trailing zero padding the matcher MD4'd over is dropped here.
 		n = m.cf.Length - off
-	}
-	if n <= 0 {
-		return
 	}
 	copy(m.out[off:off+n], data[:n])
 	if !m.got[idx] {
