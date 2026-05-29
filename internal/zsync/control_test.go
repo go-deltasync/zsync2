@@ -206,8 +206,11 @@ func TestReadZMap2Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if len(cf.ZMap2) != 8 {
-		t.Errorf("ZMap2 len=%d", len(cf.ZMap2))
+	if len(cf.ZMap2Raw) != 8 {
+		t.Errorf("ZMap2Raw len=%d", len(cf.ZMap2Raw))
+	}
+	if len(cf.ZMap) != 2 {
+		t.Errorf("ZMap len=%d, want 2 entries", len(cf.ZMap))
 	}
 }
 

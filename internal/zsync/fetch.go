@@ -35,74 +35,120 @@ func NewFetchClient() *FetchClient {
 	}
 }
 
-// ResolveTargetURL picks an absolute URL for the target file given the URLs
-// listed in the .zsync and the .zsync's own URL (used as the base for relative
-// references — matching the C client's behaviour).
-func ResolveTargetURL(cf *ControlFile, zsyncURL string) (string, error) {
-	if len(cf.URLs) == 0 {
-		return "", fmt.Errorf("zsync: no URL in .zsync (Z-URL/zmap not supported in this build)")
-	}
-	base, err := url.Parse(zsyncURL)
-	if err != nil {
-		return "", fmt.Errorf("zsync: bad zsync URL %q: %w", zsyncURL, err)
-	}
-	ref, err := url.Parse(cf.URLs[0])
-	if err != nil {
-		return "", fmt.Errorf("zsync: bad URL in .zsync %q: %w", cf.URLs[0], err)
-	}
-	return base.ResolveReference(ref).String(), nil
+// ResolveTargetURL returns every `URL:` listed in the control file resolved
+// against the .zsync's own URL (the base used for relative references — this
+// mirrors the C reference's behaviour). The returned slice preserves order:
+// callers should try entries in the order given and only fall back to the
+// next on a network error or a 5xx/404 response.
+//
+// When the control file carries a Z-Map2 / Z-URL: header for the
+// gzip-compressed-target path, callers should use ResolveCompressedURLs
+// instead — this function deliberately returns only the uncompressed URLs.
+func ResolveTargetURL(cf *ControlFile, zsyncURL string) ([]string, error) {
+	return resolveURLs(cf.URLs, zsyncURL, "URL")
 }
 
-// FetchBlocks downloads the listed missing block ranges (each [start, end)
-// in block indices) and feeds them into the matcher.
+// ResolveCompressedURLs is the Z-Map2 counterpart of ResolveTargetURL: it
+// returns the `Z-URL:` entries (URLs of the gzip-compressed target) resolved
+// against the .zsync's own URL. The caller wires these into
+// FetchClient.FetchCompressedBlocks together with the parsed Z-Map.
+func ResolveCompressedURLs(cf *ControlFile, zsyncURL string) ([]string, error) {
+	return resolveURLs(cf.ZURLs, zsyncURL, "Z-URL")
+}
+
+func resolveURLs(refs []string, base string, label string) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("zsync: no %s in .zsync", label)
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return nil, fmt.Errorf("zsync: bad zsync URL %q: %w", base, err)
+	}
+	out := make([]string, 0, len(refs))
+	for _, raw := range refs {
+		ref, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("zsync: bad %s in .zsync %q: %w", label, raw, err)
+		}
+		out = append(out, b.ResolveReference(ref).String())
+	}
+	return out, nil
+}
+
+// FetchBlocks is the single-URL convenience wrapper around FetchBlocksMulti.
+// It exists so callers that don't care about failover (every existing test
+// and the historical exported API) don't have to wrap their URL in a slice.
+// The retry semantics from FetchBlocksMulti still apply for the single URL.
+func (fc *FetchClient) FetchBlocks(targetURL string, cf *ControlFile, m *Matcher, ranges [][2]int) error {
+	return fc.FetchBlocksMulti([]string{targetURL}, cf, m, ranges)
+}
+
+// FetchBlocksMulti downloads the listed missing block ranges (each
+// [start, end) in block indices) from the first URL that accepts the Range
+// request, feeding the bytes into the matcher.
 //
 // Each range becomes one HTTP GET with a Range: header. If the server
 // honours the range it replies 206 Partial Content with just the requested
 // bytes; if it doesn't (Python's http.server is a notable example) it
 // replies 200 OK with the whole file and we slice out what we want. Both
-// paths are exercised by the smoke test.
-func (fc *FetchClient) FetchBlocks(targetURL string, cf *ControlFile, m *Matcher, ranges [][2]int) error {
+// paths are exercised by the smoke tests.
+//
+// Failover policy across the urls slice:
+//
+//   - On a network/transport error (DNS, TCP, TLS, timeout) we advance to
+//     the next URL.
+//   - On a 5xx or 404 response we advance to the next URL.
+//   - On any other 4xx we fail fast: that's a request-side problem (bad
+//     URL, auth, etc.) which retrying against the same network can only
+//     reproduce.
+//   - The last URL's error is returned verbatim so the caller gets a real
+//     diagnostic.
+//   - Once a URL accepts a Range request we "stick" to it for the remaining
+//     ranges: we don't re-run the failover loop per range.
+//
+// An empty urls slice is a programmer error and returns a clear message.
+func (fc *FetchClient) FetchBlocksMulti(urls []string, cf *ControlFile, m *Matcher, ranges [][2]int) error {
+	if len(urls) == 0 {
+		return fmt.Errorf("zsync: FetchBlocks: empty URL list")
+	}
 	bs := int64(cf.Blocksize)
 	totalLen := cf.Length
+
+	// stickyURL: once any URL has accepted a Range request we keep using
+	// it for subsequent ranges. The empty string means "not chosen yet".
+	stickyURL := ""
+
 	for _, rg := range ranges {
 		startBlk, endBlk := rg[0], rg[1] // [start, end)
 		startByte := int64(startBlk) * bs
 		// last byte is inclusive in HTTP Range
 		lastByte := int64(endBlk)*bs - 1
 		// Cap at end of file: we still want a full-blocksize payload per
-		// block (zero-padded) so the MD4 check works, so we pad below.
+		// block (zero-padded) so the strong-hash check works, so we pad below.
 		serverLast := lastByte
 		if serverLast >= totalLen {
 			serverLast = totalLen - 1
 		}
-		req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+
+		// Choose the list of URLs to try for this range: just the sticky
+		// one if we've already settled on it, otherwise the full failover
+		// list.
+		try := urls
+		if stickyURL != "" {
+			try = []string{stickyURL}
+		}
+
+		body, status, chosen, err := fc.getRangeFailover(try, startByte, serverLast)
 		if err != nil {
 			return err
 		}
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", startByte, serverLast))
-		if fc.UserAgent != "" {
-			req.Header.Set("User-Agent", fc.UserAgent)
-		}
-		resp, err := fc.HTTP.Do(req)
-		if err != nil {
-			return fmt.Errorf("zsync: GET %s: %w", targetURL, err)
-		}
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return fmt.Errorf("zsync: unexpected status %s for range %d-%d",
-				resp.Status, startByte, serverLast)
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return fmt.Errorf("zsync: read body: %w", err)
-		}
+		stickyURL = chosen
 
 		// If the server ignored Range (returned 200 OK with the whole file)
 		// the body offset for block i is `i*bs`. If it honoured the range
 		// (206) the body offset is `(i - startBlk) * bs`. Detect from the
 		// declared/observed body length.
-		bodyIsFullFile := resp.StatusCode == http.StatusOK && int64(len(body)) == totalLen
+		bodyIsFullFile := status == http.StatusOK && int64(len(body)) == totalLen
 
 		buf := make([]byte, bs)
 		for i := startBlk; i < endBlk; i++ {
@@ -114,8 +160,8 @@ func (fc *FetchClient) FetchBlocks(targetURL string, cf *ControlFile, m *Matcher
 			}
 			n := int64(len(body)) - off
 			if n <= 0 {
-				return fmt.Errorf("zsync: short HTTP response for block %d (body=%d, off=%d, status=%s)",
-					i, len(body), off, resp.Status)
+				return fmt.Errorf("zsync: short HTTP response for block %d (body=%d, off=%d, status=%d)",
+					i, len(body), off, status)
 			}
 			if n > bs {
 				n = bs
@@ -130,6 +176,104 @@ func (fc *FetchClient) FetchBlocks(targetURL string, cf *ControlFile, m *Matcher
 		}
 	}
 	return nil
+}
+
+// getRangeFailover issues an HTTP Range GET for [start, last] against each
+// URL in `urls` in order, returning the first non-error 2xx response. The
+// failover policy is documented on FetchBlocksMulti.
+//
+// On success it returns (body, status, urlThatAnswered, nil). On the last
+// URL failing it surfaces the underlying error.
+func (fc *FetchClient) getRangeFailover(urls []string, start, last int64) ([]byte, int, string, error) {
+	var lastErr error
+	for i, u := range urls {
+		body, status, err := fc.getRange(u, start, last)
+		if err == nil {
+			return body, status, u, nil
+		}
+		lastErr = err
+		// Retry on transient errors only: network/transport errors, 5xx,
+		// and 404. Anything else (other 4xx) is fatal and stops the
+		// failover loop at this URL.
+		if !shouldFailover(err) {
+			return nil, 0, "", err
+		}
+		// If we just exhausted the URL list, return the underlying error.
+		_ = i
+	}
+	return nil, 0, "", lastErr
+}
+
+// failoverError is what getRange returns for a "try the next URL" error.
+// It wraps the underlying error and carries the HTTP status code (or 0 for
+// a transport error). shouldFailover unwraps it.
+type failoverError struct {
+	status int
+	err    error
+}
+
+func (e *failoverError) Error() string { return e.err.Error() }
+func (e *failoverError) Unwrap() error { return e.err }
+
+// shouldFailover returns true if `err` is a "try the next URL" error per
+// FetchBlocksMulti's failover policy.
+func shouldFailover(err error) bool {
+	fe, ok := err.(*failoverError)
+	if !ok {
+		// Transport error from http.Client.Do is bare (no failoverError
+		// wrapper); we always retry those.
+		return true
+	}
+	if fe.status == 0 {
+		// Wrapped transport error.
+		return true
+	}
+	if fe.status >= 500 || fe.status == http.StatusNotFound {
+		return true
+	}
+	return false
+}
+
+// getRange does the actual Range GET. It returns (body, status, nil) on a
+// 200 or 206; otherwise it returns an error wrapped in *failoverError with
+// the status code so the caller's failover loop can decide whether to retry.
+func (fc *FetchClient) getRange(targetURL string, start, last int64) ([]byte, int, error) {
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		// A malformed URL is a programmer/config error and cannot be
+		// fixed by trying the next URL on the same conceptual list, BUT
+		// the caller's failover loop may still have other URLs to try
+		// that are well-formed. We treat it as transport-class (status==0)
+		// so the failover loop moves on.
+		return nil, 0, &failoverError{status: 0, err: err}
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, last))
+	if fc.UserAgent != "" {
+		req.Header.Set("User-Agent", fc.UserAgent)
+	}
+	resp, err := fc.HTTP.Do(req)
+	if err != nil {
+		return nil, 0, &failoverError{status: 0, err: fmt.Errorf("zsync: GET %s: %w", targetURL, err)}
+	}
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, resp.StatusCode, &failoverError{
+			status: resp.StatusCode,
+			err: fmt.Errorf("zsync: unexpected status %s for range %d-%d from %s",
+				resp.Status, start, last, targetURL),
+		}
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		// A read error mid-body could plausibly be the server's fault and
+		// retrying might succeed; classify as transport.
+		return nil, resp.StatusCode, &failoverError{
+			status: 0,
+			err:    fmt.Errorf("zsync: read body from %s: %w", targetURL, err),
+		}
+	}
+	return body, resp.StatusCode, nil
 }
 
 // VerifySHA1 checks the reconstructed buffer against the SHA-1 from the

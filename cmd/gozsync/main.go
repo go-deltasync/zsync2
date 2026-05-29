@@ -93,15 +93,15 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 	}
 
 	if len(missing) > 0 {
-		targetURL, err := zsync.ResolveTargetURL(cf, baseURL)
+		targetURLs, err := zsync.ResolveTargetURL(cf, baseURL)
 		if err != nil {
 			return err
 		}
 		if !quiet {
-			fmt.Fprintf(os.Stderr, "fetching from %s\n", targetURL)
+			fmt.Fprintf(os.Stderr, "fetching from %s (with %d URL fallback(s))\n", targetURLs[0], len(targetURLs)-1)
 		}
 		fc := zsync.NewFetchClient()
-		if err := fc.FetchBlocks(targetURL, cf, m, missing); err != nil {
+		if err := fc.FetchBlocksMulti(targetURLs, cf, m, missing); err != nil {
 			return err
 		}
 	}

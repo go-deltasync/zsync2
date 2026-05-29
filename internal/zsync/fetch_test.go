@@ -19,7 +19,7 @@ func TestResolveTargetURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "http://example.com/dir/target.bin" {
+	if len(got) != 1 || got[0] != "http://example.com/dir/target.bin" {
 		t.Errorf("got %q", got)
 	}
 
@@ -29,7 +29,7 @@ func TestResolveTargetURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "https://cdn.example.com/x.bin" {
+	if len(got) != 1 || got[0] != "https://cdn.example.com/x.bin" {
 		t.Errorf("got %q", got)
 	}
 }
