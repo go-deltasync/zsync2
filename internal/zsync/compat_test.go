@@ -238,6 +238,55 @@ func TestCompatUpstreamMakeOurApply(t *testing.T) {
 	}
 }
 
+// TestCompatZsync2NotRecognisedByUpstream documents the deliberate
+// non-symmetry of the proposal-blake3 compat matrix: a .zsync2 produced
+// by our maker is *not* readable by the upstream C zsync client, because
+// the magic line bump (`zsync2: 1.0` vs `zsync: 0.6`) is one-way by design.
+// We skip cleanly when the upstream tools aren't installed; otherwise we
+// produce a .zsync2 and assert upstream `zsync` exits non-zero with a
+// "not a zsync file"-style error, which is the documented safe behaviour.
+func TestCompatZsync2NotRecognisedByUpstream(t *testing.T) {
+	zsyncBin, _ := requireZsyncTools(t)
+
+	dir := t.TempDir()
+	target := make([]byte, 32*1024)
+	if _, err := rand.Read(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "target.bin"), target, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.FileServer(http.Dir(dir)))
+	defer srv.Close()
+
+	// Build a zsync2-format control file with our MakeWithAlgo.
+	cf, err := MakeWithAlgo(bytes.NewReader(target), int64(len(target)), 2048, "target.bin",
+		time.Time{}, []string{srv.URL + "/target.bin"}, HashAlgoBLAKE3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zPath := filepath.Join(dir, "target.bin.zsync2")
+	zf, err := os.Create(zPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cf.Write(zf); err != nil {
+		t.Fatal(err)
+	}
+	zf.Close()
+
+	outPath := filepath.Join(dir, "out.bin")
+	// We expect upstream zsync to refuse the new format. This is the
+	// proposal's stated safety property: the magic-line bump prevents an
+	// old parser from misinterpreting BLAKE3 bytes as MD4.
+	cmd := exec.Command(zsyncBin, "-o", outPath, zPath)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("upstream zsync unexpectedly accepted a .zsync2: out=%s", out)
+	}
+}
+
 // TestCompatRoundtripParse parses an upstream-generated .zsync with our
 // Read, re-serialises it with our Write, and asserts that the parsed-twice
 // representation is identical to the once-parsed one (i.e. our writer
