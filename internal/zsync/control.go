@@ -37,6 +37,13 @@ const DefaultVersionZsync = "0.6.2"
 // `zsync2: ` magic line when Format == FormatZsync2.
 const DefaultVersionZsync2 = "1.0"
 
+// gzbNotBlockStart is the high bit of the on-wire `outbyteoffset` field of a
+// Z-Map2 entry (`struct gzblock` in libzsync/zmap.h). When set, the entry is
+// a mid-block restart checkpoint rather than the start of a fresh deflate
+// block — the deflate state from the preceding block-start entry must
+// already be live for it to be usable.
+const gzbNotBlockStart = 0x8000
+
 // ControlFile is the in-memory representation of a parsed .zsync (or
 // .zsync2) file.
 //
@@ -90,9 +97,16 @@ type ControlFile struct {
 	Safe        string
 	MinVersion  string
 	Recompress  string
-	// ZMap2 bytes (4 bytes per entry). Present iff the original was a gzip;
-	// not interpreted by this implementation.
-	ZMap2 []byte
+	// ZMap2Raw is the verbatim Z-Map2 byte payload (4 bytes per entry) as it
+	// appeared after the `Z-Map2:` header line. Kept so Write can round-trip
+	// the original wire format byte-for-byte.
+	ZMap2Raw []byte
+	// ZMap is the parsed Z-Map2 restart-point table, in stream order. It is
+	// populated alongside ZMap2Raw by Read whenever a Z-Map2 header is
+	// present; consumers needing the random-access decompression path
+	// described in Phipps' paper §5 use it via FetchClient. An empty ZMap
+	// means the .zsync indexes an uncompressed target (the common case).
+	ZMap []ZMapEntry
 
 	// Blocks is the per-block checksum table, in target-file order.
 	Blocks []BlockChecksum
@@ -106,6 +120,31 @@ type ControlFile struct {
 type BlockChecksum struct {
 	Rsum     Rsum   // A is masked per RsumAMask(rsum_bytes); when rsum_bytes<3 A==0.
 	Checksum []byte // leading checksum_bytes of the strong hash (MD4 or BLAKE3)
+}
+
+// ZMapEntry is one restart point in a Z-Map2 table: the absolute position in
+// the deflate bitstream (Compressed, counted in bits) and the absolute byte
+// offset into the *uncompressed* stream that this restart point corresponds
+// to. Restart points come from zsyncmake's patched zlib (libzsync/zmap.c in
+// the C reference); a client uses them to fetch a contiguous gz byte range,
+// reset the deflate state at the entry's bit-aligned position, decompress
+// just enough bytes to cover one or more missing uncompressed ranges, and
+// feed the decompressed bytes to the rolling-checksum matcher.
+//
+// IsBlockStart is true when this entry sits at a deflate block boundary
+// (zsyncmake's GZB_NOTBLOCKSTART high bit clear in the on-wire outbyteoffset
+// field). Only block-start entries can be used to (re)initialise a fresh
+// flate.Reader; non-block-start entries are mid-block checkpoints that
+// require the deflate state to already be live from a previous block start.
+//
+// BlockCount is the index of this entry within its containing deflate block
+// (0 == block start, 1, 2, ... == subsequent in-block checkpoints), matching
+// the same field on struct zmapentry in libzsync/zmap.c.
+type ZMapEntry struct {
+	Inflated     uint64 // absolute byte offset into the uncompressed stream
+	Compressed   uint64 // absolute bit offset into the compressed stream
+	IsBlockStart bool
+	BlockCount   int
 }
 
 // NumBlocks returns the number of blocks the target file decomposes into.
@@ -336,13 +375,61 @@ func (c *ControlFile) applyHeader(key, val string, br *bufio.Reader) error {
 			c.HasMTime = true
 		}
 	case "Z-Map2":
+		// The Z-Map2 wire format, mirroring libzsync/zmap.h's struct gzblock
+		// and the absolute-offset reconstruction in zmap_make():
+		//
+		//   Z-Map2: <n>\n
+		//   <n * 4 raw bytes>
+		//
+		// Each 4-byte entry is two network-order uint16s, both encoding
+		// *deltas* from the previous entry:
+		//
+		//   bytes 0..1 : inbitoffset  (delta, in bits, into the compressed
+		//                              deflate stream from the previous entry)
+		//   bytes 2..3 : outbyteoffset (delta, in bytes, into the inflated
+		//                              stream from the previous entry; the
+		//                              high bit, 0x8000 == GZB_NOTBLOCKSTART,
+		//                              flags a mid-block checkpoint rather
+		//                              than a fresh deflate block start)
+		//
+		// The first entry's "previous" is (0, 0).
 		n, err := strconv.Atoi(val)
 		if err != nil || n < 0 {
 			return fmt.Errorf("zsync: bad Z-Map2 %q", val)
 		}
-		c.ZMap2 = make([]byte, 4*n)
-		if _, err := io.ReadFull(br, c.ZMap2); err != nil {
+		// zsync2: 1.0 + Z-Map2 is intentionally unspecified — the BLAKE3
+		// proposal hasn't pinned down how the gzip-restart-point machinery
+		// interacts with the new strong-hash semantics yet. Reject loudly
+		// rather than try to combine them and emit something we'd later
+		// have to call wrong.
+		if c.Format == FormatZsync2 {
+			return fmt.Errorf("zsync: Z-Map2 on a zsync2 file is not supported (gzip random-access wire interaction is unspecified)")
+		}
+		c.ZMap2Raw = make([]byte, 4*n)
+		if _, err := io.ReadFull(br, c.ZMap2Raw); err != nil {
 			return fmt.Errorf("zsync: short read on Z-Map2: %w", err)
+		}
+		c.ZMap = make([]ZMapEntry, n)
+		var inBits, outBytes uint64
+		var blockCount int
+		for i := 0; i < n; i++ {
+			inDelta := uint64(binary.BigEndian.Uint16(c.ZMap2Raw[4*i : 4*i+2]))
+			ob := binary.BigEndian.Uint16(c.ZMap2Raw[4*i+2 : 4*i+4])
+			notStart := (ob & gzbNotBlockStart) != 0
+			outDelta := uint64(ob &^ gzbNotBlockStart)
+			inBits += inDelta
+			outBytes += outDelta
+			if notStart {
+				blockCount++
+			} else {
+				blockCount = 0
+			}
+			c.ZMap[i] = ZMapEntry{
+				Inflated:     outBytes,
+				Compressed:   inBits,
+				IsBlockStart: !notStart,
+				BlockCount:   blockCount,
+			}
 		}
 	default:
 		// Ignore unknown keys if listed in "Safe:", else bail like the C code.
@@ -423,11 +510,26 @@ func (c *ControlFile) Write(w io.Writer) error {
 	for _, u := range c.URLs {
 		writeKV("URL", u)
 	}
+	for _, u := range c.ZURLs {
+		writeKV("Z-URL", u)
+	}
 	if zsync2 && len(c.FileHash) > 0 {
 		writeKV("File-Hash", fmt.Sprintf("%s:%s", c.HashAlgorithm, hex.EncodeToString(c.FileHash)))
 	}
 	if c.SHA1Hex != "" {
 		writeKV("SHA-1", c.SHA1Hex)
+	}
+	if c.Recompress != "" {
+		writeKV("Recompress", c.Recompress)
+	}
+	// Z-Map2 must precede the terminating blank line. We emit the count line
+	// and then the raw 4-byte-per-entry payload byte-for-byte so an upstream
+	// `zsync` round-trips ours; we never re-encode the deltas because the C
+	// reference doesn't either.
+	if len(c.ZMap2Raw) > 0 {
+		n := len(c.ZMap2Raw) / 4
+		writeKV("Z-Map2", strconv.Itoa(n))
+		bw.Write(c.ZMap2Raw) //nolint:errcheck // surfaced via bw.Flush below
 	}
 	// End of headers.
 	bw.WriteString("\n") //nolint:errcheck // surfaced via bw.Flush below

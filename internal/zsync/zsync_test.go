@@ -142,12 +142,12 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal("matched everything? seed mutation didn't take")
 	}
 	missing := m.MissingRanges()
-	targetURL, err := ResolveTargetURL(cf2, srv.URL+"/target.bin.zsync")
+	targetURLs, err := ResolveTargetURL(cf2, srv.URL+"/target.bin.zsync")
 	if err != nil {
 		t.Fatal(err)
 	}
 	fc := NewFetchClient()
-	if err := fc.FetchBlocks(targetURL, cf2, m, missing); err != nil {
+	if err := fc.FetchBlocksMulti(targetURLs, cf2, m, missing); err != nil {
 		t.Fatal(err)
 	}
 	if got := m.AcceptedBlocks(); got != m.TotalBlocks() {
