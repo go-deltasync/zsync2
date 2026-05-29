@@ -1271,6 +1271,126 @@ func TestWalkerDynamicLensCode16Overruns(t *testing.T) {
 	}
 }
 
+// TestDecodeBlockBodyLitSymbolReadError — the very first decodeSymbol
+// inside decodeBlockBody hits EOF on its 1-bit read. Drives the
+// `if err != nil` arm at deflate_walker.go:547.
+func TestDecodeBlockBodyLitSymbolReadError(t *testing.T) {
+	// 1-symbol litLen table: bit "0" → sym 256 (EOB). Empty input → the
+	// first Read inside decodeSymbol returns io.ErrUnexpectedEOF.
+	litLens := make([]int, 257)
+	litLens[256] = 1
+	litCode := buildCanonicalCode(litLens)
+	// dist table is unused on this code path but must be non-nil.
+	distLens := make([]int, 30)
+	distLens[0] = 1
+	distCode := buildCanonicalCode(distLens)
+	w := &DeflateWalker{br: newBitReader(bytes.NewReader(nil))}
+	if err := w.decodeBlockBody(litCode, distCode); err == nil {
+		t.Fatal("expected EOF in decodeSymbol(litCode)")
+	}
+}
+
+// TestDecodeBlockBodyLengthReadError — decodeSymbol returns a length
+// symbol (257..285) but decodeLength's extra-bits read EOFs. Drives
+// the `if err != nil` arm at deflate_walker.go:560.
+func TestDecodeBlockBodyLengthReadError(t *testing.T) {
+	// litLen table: only sym 273 with length 8 → 1 code "00000000".
+	// 273 - 257 = 16; lengthExtra[16] = 3 → after the 8 code bits the
+	// bitReader's accumulator is empty; the 3-extra-bits Read forces a
+	// fresh byte fetch, which EOFs.
+	litLens := make([]int, 286)
+	litLens[273] = 8
+	litCode := buildCanonicalCode(litLens)
+	distLens := make([]int, 30)
+	distLens[0] = 1
+	distCode := buildCanonicalCode(distLens)
+	w := &DeflateWalker{br: newBitReader(bytes.NewReader([]byte{0x00}))}
+	if err := w.decodeBlockBody(litCode, distCode); err == nil {
+		t.Fatal("expected EOF in decodeLength extras")
+	}
+}
+
+// TestDecodeBlockBodyDistSymbolReadError — length symbol decoded with
+// zero extras, then the distance symbol's Read EOFs. Drives the
+// `if err != nil` arm at deflate_walker.go:564.
+func TestDecodeBlockBodyDistSymbolReadError(t *testing.T) {
+	// 264 - 257 = 7; lengthExtra[7] = 0 → decodeLength consumes no extras.
+	// litLen code is 8 bits "00000000" so the buffer is empty after.
+	// distCode.decodeSymbol then tries Read(1) which fetches a new byte
+	// and EOFs.
+	litLens := make([]int, 286)
+	litLens[264] = 8
+	litCode := buildCanonicalCode(litLens)
+	distLens := make([]int, 30)
+	distLens[0] = 1
+	distCode := buildCanonicalCode(distLens)
+	w := &DeflateWalker{br: newBitReader(bytes.NewReader([]byte{0x00}))}
+	if err := w.decodeBlockBody(litCode, distCode); err == nil {
+		t.Fatal("expected EOF in decodeSymbol(distCode)")
+	}
+}
+
+// TestDecodeBlockBodyDistanceReadError — length and distance symbols
+// decoded, then decodeDistance's extra-bits read EOFs. Drives the
+// `if err != nil` arm at deflate_walker.go:571.
+func TestDecodeBlockBodyDistanceReadError(t *testing.T) {
+	// litLen sym 264 (zero extras) at code "00000000" (8 bits).
+	// distCode sym 4 at code "00000000" (8 bits). distanceExtra[4] = 1
+	// → after the second byte is consumed, the bitReader is empty and
+	// the 1-bit extras read EOFs.
+	litLens := make([]int, 286)
+	litLens[264] = 8
+	litCode := buildCanonicalCode(litLens)
+	distLens := make([]int, 30)
+	distLens[4] = 8
+	distCode := buildCanonicalCode(distLens)
+	w := &DeflateWalker{br: newBitReader(bytes.NewReader([]byte{0x00, 0x00}))}
+	if err := w.decodeBlockBody(litCode, distCode); err == nil {
+		t.Fatal("expected EOF in decodeDistance extras")
+	}
+}
+
+// TestWalkerDynamicLensCode17Overruns — code 17 sequence whose
+// cumulative skip overruns the lit/dist lengths table. Drives the
+// `i+n > total` rejection at deflate_walker.go:517.
+//
+// HLIT=0 (nLit=257), HDIST=0 (nDist=1) → total=258. Code 17 with
+// max extras (0b111 = 7) skips n = 3+7 = 10 zeros per occurrence;
+// 26 consecutive 17s push i to 260, which exceeds 258.
+func TestWalkerDynamicLensCode17OverrunsTable(t *testing.T) {
+	bits := []int{}
+	push := func(v, n int) {
+		for i := 0; i < n; i++ {
+			bits = append(bits, (v>>i)&1)
+		}
+	}
+	push(0, 5)  // HLIT=0
+	push(0, 5)  // HDIST=0
+	push(0, 4)  // HCLEN=0 → 4 CL codes
+	push(0, 3)  // CL[16]
+	push(1, 3)  // CL[17] = 1 → "1" decodes to sym 17 (sym 0 takes "0")
+	push(0, 3)  // CL[18]
+	push(1, 3)  // CL[0]  = 1
+	// buildCanonicalCode buckets symbols by sym-index within a length:
+	// at length 1, syms = [0, 17] → bit "0" = sym 0, bit "1" = sym 17.
+	// 26 × (sym 17 = "1" + 3 extras "111") = 26 × 4 bits = 104 bits.
+	for j := 0; j < 26; j++ {
+		push(1, 1)
+		push(7, 3)
+	}
+	for len(bits)%8 != 0 {
+		bits = append(bits, 0)
+	}
+	buf := make([]byte, len(bits)/8)
+	for i, b := range bits {
+		buf[i/8] |= byte(b) << uint(i%8)
+	}
+	w := &DeflateWalker{br: newBitReader(bytes.NewReader(buf))}
+	if err := w.walkDynamicHuffman(); err == nil {
+		t.Fatal("expected code-17 overrun rejection")
+	}
+}
+
 // TestWalkerDynamicHCLENTruncated — header asks for many CL lengths
 // but the stream cuts off before reading them all.
 func TestWalkerDynamicHCLENTruncated(t *testing.T) {
