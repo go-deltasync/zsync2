@@ -106,7 +106,9 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 		}
 	}
 
-	if err := zsync.VerifySHA1(cf, m.Out()); err != nil {
+	// VerifyFileHash covers both the classic SHA-1 path (when FileHash is
+	// empty and SHA1Hex is set) and the zsync2 BLAKE3 path.
+	if err := zsync.VerifyFileHash(cf, m.Out()); err != nil {
 		return err
 	}
 
@@ -114,7 +116,10 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 	if out == "" {
 		out = cf.Filename
 		if out == "" {
-			out = strings.TrimSuffix(filepath.Base(baseURL), ".zsync")
+			base := filepath.Base(baseURL)
+			base = strings.TrimSuffix(base, ".zsync2")
+			base = strings.TrimSuffix(base, ".zsync")
+			out = base
 		}
 		if out == "" || out == "." || out == "/" {
 			return fmt.Errorf("could not derive output filename; pass --output")
