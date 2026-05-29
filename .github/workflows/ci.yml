@@ -43,14 +43,14 @@ jobs:
           go test -race -coverprofile=cover.out ./...
           go tool cover -func=cover.out | tee cover.txt
           # The CLIs in cmd/ are thin wrappers around the internal package
-          # and intentionally have no unit tests; we enforce >=99% coverage
+          # and intentionally have no unit tests; we enforce 100% coverage
           # on the library (internal/zsync) only, which is where the
           # protocol-correctness logic lives.
           pkg_cov=$(go test -coverprofile=cover-pkg.out ./internal/zsync >/dev/null 2>&1 && \
                     go tool cover -func=cover-pkg.out | tail -n 1 | awk '{print $3}' | tr -d '%')
           echo "internal/zsync coverage: ${pkg_cov}%"
-          awk -v t="$pkg_cov" 'BEGIN { exit !(t+0 >= 99.0) }' || {
-            echo "::error::internal/zsync coverage ${pkg_cov}% < 99%"; exit 1; }
+          awk -v t="$pkg_cov" 'BEGIN { exit !(t+0 >= 100.0) }' || {
+            echo "::error::internal/zsync coverage ${pkg_cov}% < 100%"; exit 1; }
 
       - name: Upload coverage profile
         if: always()
