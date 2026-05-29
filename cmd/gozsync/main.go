@@ -4,12 +4,13 @@
 // fetching only the changed blocks over HTTP Range requests.
 //
 // This is the cross-platform counterpart of Colin Phipps' `zsync` (C) and
-// of the AppImageCommunity/zsync2 (C++). MVP scope: no compressed targets
-// (no Z-Map2), no multi-URL failover, no resumable on-disk staging.
+// of the AppImageCommunity/zsync2 (C++).
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,10 @@ import (
 	"github.com/go-deltasync/zsync2/internal/zsync"
 	"github.com/spf13/cobra"
 )
+
+// errUpToDate is returned by run when the server replies 304 Not Modified
+// to a conditional GET of the .zsync. Main prints a message and exits 0.
+var errUpToDate = errors.New("already up to date")
 
 func main() {
 	var (
@@ -47,13 +52,33 @@ original zsync (Colin Phipps) and AppImageCommunity/zsync2.`,
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress progress output")
 
 	if err := cmd.Execute(); err != nil {
+		if errors.Is(err, errUpToDate) {
+			if !quiet {
+				fmt.Fprintln(os.Stderr, "already up to date")
+			}
+			os.Exit(0)
+		}
 		fmt.Fprintf(os.Stderr, "gozsync: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func run(loc, seedPath, outPath string, quiet bool) error {
-	cf, baseURL, err := loadControlFile(loc)
+	// If we already have an existing output / seed file with an mtime, send
+	// `If-Modified-Since:` on the .zsync GET. A 304 short-circuits the run.
+	var ifModSince time.Time
+	if outPath != "" {
+		if st, err := os.Stat(outPath); err == nil {
+			ifModSince = st.ModTime()
+		}
+	}
+	if ifModSince.IsZero() && seedPath != "" {
+		if st, err := os.Stat(seedPath); err == nil {
+			ifModSince = st.ModTime()
+		}
+	}
+
+	cf, baseURL, err := loadControlFile(loc, ifModSince)
 	if err != nil {
 		return err
 	}
@@ -65,10 +90,38 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 
 	m := zsync.NewMatcher(cf)
 
+	// Resolve output path early — both the resume-from-.partial seed step
+	// and the final write need it.
+	out := outPath
+	if out == "" {
+		out = cf.Filename
+		if out == "" {
+			base := filepath.Base(baseURL)
+			base = strings.TrimSuffix(base, ".zsync2")
+			base = strings.TrimSuffix(base, ".zsync")
+			out = base
+		}
+		if out == "" || out == "." || out == "/" {
+			return fmt.Errorf("could not derive output filename; pass --output")
+		}
+	}
+
+	// Order of seeds: the explicit --input first, then any stale <out>.partial
+	// left over from a previous interrupted run. Both can supply blocks; the
+	// matcher's idempotent acceptance means we won't double-count.
+	seedPaths := []string{}
 	if seedPath != "" {
-		sf, err := os.Open(seedPath)
+		seedPaths = append(seedPaths, seedPath)
+	}
+	partial := out + ".partial"
+	if _, err := os.Stat(partial); err == nil {
+		seedPaths = append(seedPaths, partial)
+	}
+
+	for _, sp := range seedPaths {
+		sf, err := os.Open(sp)
 		if err != nil {
-			return fmt.Errorf("open seed %s: %w", seedPath, err)
+			return fmt.Errorf("open seed %s: %w", sp, err)
 		}
 		t0 := time.Now()
 		err = m.FeedSeed(sf)
@@ -77,8 +130,8 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 			return fmt.Errorf("feed seed: %w", err)
 		}
 		if !quiet {
-			fmt.Fprintf(os.Stderr, "seed scan: matched %d/%d blocks in %s\n",
-				m.AcceptedBlocks(), m.TotalBlocks(), time.Since(t0).Round(time.Millisecond))
+			fmt.Fprintf(os.Stderr, "seed scan %s: matched %d/%d blocks in %s\n",
+				sp, m.AcceptedBlocks(), m.TotalBlocks(), time.Since(t0).Round(time.Millisecond))
 		}
 	}
 
@@ -112,21 +165,24 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 		return err
 	}
 
-	out := outPath
-	if out == "" {
-		out = cf.Filename
-		if out == "" {
-			base := filepath.Base(baseURL)
-			base = strings.TrimSuffix(base, ".zsync2")
-			base = strings.TrimSuffix(base, ".zsync")
-			out = base
-		}
-		if out == "" || out == "." || out == "/" {
-			return fmt.Errorf("could not derive output filename; pass --output")
-		}
+	// Resumable on-disk staging: write to `out.partial` first, then rename
+	// into place. A crashed or interrupted run leaves a `.partial` behind
+	// that we can pick up as a seed on the next invocation.
+	partial = out + ".partial"
+	if err := os.WriteFile(partial, m.Out(), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", partial, err)
 	}
-	if err := os.WriteFile(out, m.Out(), 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", out, err)
+	if err := os.Rename(partial, out); err != nil {
+		return fmt.Errorf("rename %s -> %s: %w", partial, out, err)
+	}
+	// MTime preservation: if the control file carried one, stamp the output
+	// with it so the reconstructed file matches the upstream timestamp.
+	if cf.HasMTime {
+		if err := os.Chtimes(out, cf.MTime, cf.MTime); err != nil {
+			// Non-fatal: timestamps can fail on read-only filesystems or
+			// network mounts that don't honour utimes. Warn but continue.
+			fmt.Fprintf(os.Stderr, "warning: could not preserve MTime on %s: %v\n", out, err)
+		}
 	}
 	if !quiet {
 		fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", out, cf.Length)
@@ -134,7 +190,7 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 	return nil
 }
 
-func loadControlFile(loc string) (*zsync.ControlFile, string, error) {
+func loadControlFile(loc string, ifModSince time.Time) (*zsync.ControlFile, string, error) {
 	// If it parses as an absolute http(s) URL, fetch over HTTP. Otherwise
 	// treat as a local path.
 	if u, err := url.Parse(loc); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
@@ -143,11 +199,20 @@ func loadControlFile(loc string) (*zsync.ControlFile, string, error) {
 			return nil, "", err
 		}
 		req.Header.Set("User-Agent", "gozsync/0.1")
+		if !ifModSince.IsZero() {
+			req.Header.Set("If-Modified-Since", ifModSince.UTC().Format(http.TimeFormat))
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return nil, "", fmt.Errorf("GET %s: %w", loc, err)
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotModified {
+			// Drain body to allow connection reuse, then surface a sentinel
+			// the caller turns into a clean exit-0.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			return nil, "", errUpToDate
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, "", fmt.Errorf("GET %s: %s", loc, resp.Status)
 		}
