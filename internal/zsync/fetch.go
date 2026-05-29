@@ -87,11 +87,17 @@ func (fc *FetchClient) FetchBlocks(targetURL string, cf *ControlFile, m *Matcher
 // [start, end) in block indices) from the first URL that accepts the Range
 // request, feeding the bytes into the matcher.
 //
-// Each range becomes one HTTP GET with a Range: header. If the server
-// honours the range it replies 206 Partial Content with just the requested
-// bytes; if it doesn't (Python's http.server is a notable example) it
-// replies 200 OK with the whole file and we slice out what we want. Both
-// paths are exercised by the smoke tests.
+// The implementation first attempts a single batched GET listing every
+// missing run in one `Range: bytes=a-b,c-d,…` header (RFC 7233 §3.1). A
+// well-behaved origin replies 206 Partial Content with a
+// `multipart/byteranges` body that we demultiplex and feed to the matcher.
+// Two graceful fallbacks cover non-compliant servers:
+//
+//   - 206 with a single `Content-Range` (server refused multi-range, common
+//     on some CDNs): we drop to the per-range loop and reissue one GET per
+//     missing run.
+//   - 200 OK (server ignored Range entirely, e.g. Python's http.server):
+//     we slice the whole-file body for every missing run.
 //
 // Failover policy across the urls slice:
 //
@@ -110,6 +116,24 @@ func (fc *FetchClient) FetchBlocks(targetURL string, cf *ControlFile, m *Matcher
 func (fc *FetchClient) FetchBlocksMulti(urls []string, cf *ControlFile, m *Matcher, ranges [][2]int) error {
 	if len(urls) == 0 {
 		return fmt.Errorf("zsync: FetchBlocks: empty URL list")
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+	// Try the batched path first when we have more than one missing run.
+	// A single range is naturally handled by the per-range loop and there's
+	// no win in dressing it up as a multi-range request.
+	if len(ranges) > 1 {
+		batched, err := fc.tryBatchedRanges(urls, cf, m, ranges)
+		if err != nil {
+			return err
+		}
+		if batched {
+			return nil
+		}
+		// Fell through: server didn't honour multi-range. Drop to the
+		// per-range loop, which knows how to deal with 200-fallback and
+		// single-Content-Range 206.
 	}
 	bs := int64(cf.Blocksize)
 	totalLen := cf.Length
@@ -170,6 +194,191 @@ func (fc *FetchClient) FetchBlocksMulti(urls []string, cf *ControlFile, m *Match
 				buf[j] = 0
 			}
 			copy(buf, body[off:off+n])
+			if err := m.AcceptDownloadedBlock(i, buf); err != nil {
+				return fmt.Errorf("zsync: block %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+// tryBatchedRanges issues ONE HTTP GET listing every missing run in the
+// `Range:` header as `bytes=a-b,c-d,…`. It returns (true, nil) when the
+// server honoured the multi-range request and the matcher has been fed
+// every requested run; (false, nil) when the server didn't honour
+// multi-range (a 200 OK or a single-range 206) so the caller should drop
+// to the per-range loop; (_, err) on any unrecoverable failure.
+//
+// The first URL whose response can be classified ((batched OK) | (fall
+// back to per-range)) wins; failover only triggers on transport / 5xx /
+// 404 errors (same policy as the single-range path).
+//
+// The MaxRangesPerRequest cap from FetchClient bounds how many ranges land
+// in one Range: header. If the caller's missing-runs list exceeds the cap
+// we chunk it (still cheaper than one-GET-per-run, but bounded so an
+// adversarial server can't blow up on a 10k-range header).
+func (fc *FetchClient) tryBatchedRanges(urls []string, cf *ControlFile, m *Matcher, ranges [][2]int) (bool, error) {
+	bs := int64(cf.Blocksize)
+	totalLen := cf.Length
+	cap := fc.MaxRangesPerRequest
+	if cap <= 0 {
+		cap = 50
+	}
+
+	stickyURL := ""
+
+	for start := 0; start < len(ranges); start += cap {
+		end := start + cap
+		if end > len(ranges) {
+			end = len(ranges)
+		}
+		chunk := ranges[start:end]
+
+		// Build the Range header. Each missing-block run [bs, be) becomes
+		// a byte range [startByte, lastByte] (HTTP byte ranges are
+		// inclusive on both ends).
+		var rangeHdr strings.Builder
+		rangeHdr.WriteString("bytes=")
+		byteRanges := make([][2]int64, 0, len(chunk))
+		for i, rg := range chunk {
+			startByte := int64(rg[0]) * bs
+			lastByte := int64(rg[1])*bs - 1
+			if lastByte >= totalLen {
+				lastByte = totalLen - 1
+			}
+			if i > 0 {
+				rangeHdr.WriteByte(',')
+			}
+			fmt.Fprintf(&rangeHdr, "%d-%d", startByte, lastByte)
+			byteRanges = append(byteRanges, [2]int64{startByte, lastByte})
+		}
+
+		try := urls
+		if stickyURL != "" {
+			try = []string{stickyURL}
+		}
+		body, status, contentType, chosen, err := fc.getMultiRangeFailover(try, rangeHdr.String())
+		if err != nil {
+			return false, err
+		}
+		stickyURL = chosen
+
+		// Server ignored Range entirely: caller falls back to per-range
+		// path. Caller's stickyURL machinery will re-discover this URL.
+		if status == http.StatusOK && int64(len(body)) == totalLen {
+			return false, nil
+		}
+		// Server honoured multi-range with a multipart/byteranges body.
+		if status == http.StatusPartialContent && strings.HasPrefix(contentType, "multipart/byteranges") {
+			parts, err := parseMultipartByteRanges(contentType, bytes.NewReader(body))
+			if err != nil {
+				return false, fmt.Errorf("zsync: parse multipart/byteranges: %w", err)
+			}
+			if err := fc.feedMultipartParts(parts, byteRanges, chunk, cf, m); err != nil {
+				return false, err
+			}
+			continue
+		}
+		// Server honoured Range but with a single-range 206 (no
+		// multipart body). Tell the caller to fall back to the
+		// per-range loop, which knows how to slice this out.
+		//
+		// getMultiRange already rejected every status other than 200 and
+		// 206 via failoverError, so this is the only remaining shape.
+		return false, nil
+	}
+	return true, nil
+}
+
+// getMultiRangeFailover issues a Range: <hdr> GET against each URL in
+// `urls` in order. Mirrors getRangeFailover but returns the Content-Type
+// too (we need it to demux multipart/byteranges).
+func (fc *FetchClient) getMultiRangeFailover(urls []string, rangeHdr string) (body []byte, status int, contentType, chosen string, err error) {
+	var lastErr error
+	for _, u := range urls {
+		body, status, contentType, err = fc.getMultiRange(u, rangeHdr)
+		if err == nil {
+			return body, status, contentType, u, nil
+		}
+		lastErr = err
+		if !shouldFailover(err) {
+			return nil, 0, "", "", err
+		}
+	}
+	return nil, 0, "", "", lastErr
+}
+
+// getMultiRange does the actual Range GET with a multi-range header.
+func (fc *FetchClient) getMultiRange(targetURL, rangeHdr string) ([]byte, int, string, error) {
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, 0, "", &failoverError{status: 0, err: err}
+	}
+	req.Header.Set("Range", rangeHdr)
+	if fc.UserAgent != "" {
+		req.Header.Set("User-Agent", fc.UserAgent)
+	}
+	resp, err := fc.HTTP.Do(req)
+	if err != nil {
+		return nil, 0, "", &failoverError{status: 0, err: fmt.Errorf("zsync: GET %s: %w", targetURL, err)}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return nil, resp.StatusCode, "", &failoverError{
+			status: resp.StatusCode,
+			err:    fmt.Errorf("zsync: unexpected status %s for multi-range from %s", resp.Status, targetURL),
+		}
+	}
+	ct := resp.Header.Get("Content-Type")
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, ct, &failoverError{status: 0, err: fmt.Errorf("zsync: read body from %s: %w", targetURL, err)}
+	}
+	return b, resp.StatusCode, ct, nil
+}
+
+// feedMultipartParts walks the demultiplexed multipart parts and pushes
+// each one through the matcher. We trust the Content-Range on each part
+// for the inflated byte offset and decode the block index from that.
+//
+// Servers MAY reorder ranges; we re-associate each part with the original
+// chunk entry by its start-byte rather than relying on iteration order.
+// Some servers also coalesce adjacent ranges: a part whose Start doesn't
+// appear in our request map is skipped (the missed blocks then surface as
+// errors at the matcher's strong-hash check, which is the right place to
+// report the protocol violation).
+func (fc *FetchClient) feedMultipartParts(parts []multipartPart, asked [][2]int64, chunk [][2]int, cf *ControlFile, m *Matcher) error {
+	bs := int64(cf.Blocksize)
+	type want struct {
+		startBlk, endBlk int
+	}
+	wantByStart := make(map[int64]want, len(chunk))
+	for i, rg := range chunk {
+		wantByStart[asked[i][0]] = want{startBlk: rg[0], endBlk: rg[1]}
+	}
+	buf := make([]byte, bs)
+	for _, p := range parts {
+		w, ok := wantByStart[p.Start]
+		if !ok {
+			continue
+		}
+		// Walk the blocks covered by this part. The server may have
+		// returned a shorter body than we asked for (tail of file
+		// capped at Content-Length-1); zero-pad the trailing short
+		// block to a full blocksize so the strong-hash check works.
+		for i := w.startBlk; i < w.endBlk; i++ {
+			off := int64(i-w.startBlk) * bs
+			n := int64(len(p.Body)) - off
+			if n <= 0 {
+				return fmt.Errorf("zsync: short multipart payload for block %d (body=%d off=%d)", i, len(p.Body), off)
+			}
+			if n > bs {
+				n = bs
+			}
+			for j := range buf {
+				buf[j] = 0
+			}
+			copy(buf, p.Body[off:off+n])
 			if err := m.AcceptDownloadedBlock(i, buf); err != nil {
 				return fmt.Errorf("zsync: block %d: %w", i, err)
 			}
