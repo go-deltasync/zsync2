@@ -13,37 +13,69 @@ import (
 	"time"
 )
 
-// ControlFile is the in-memory representation of a parsed .zsync file.
+// Format identifies the on-the-wire .zsync flavour parsed/emitted by this
+// package.
 //
-// The wire format, as written by Phipps' make.c, is:
+//   - FormatZsync is Colin Phipps' classic 2005 wire format. The first
+//     header line is `zsync: <version>`; the strong block hash is MD4 and
+//     the file-wide hash is SHA-1.
+//   - FormatZsync2 is the upgraded wire format proposed in
+//     https://go-deltasync.github.io/zsync2/proposal-blake3/. The first
+//     header line is `zsync2: <version>`; the strong block hash and the
+//     file-wide hash both default to BLAKE3, switchable via
+//     `Hash-Algorithm:` and `File-Hash:` headers.
+const (
+	FormatZsync  = "zsync"
+	FormatZsync2 = "zsync2"
+)
+
+// DefaultVersionZsync is the default version emitted on the
+// `zsync: ` magic line when Format == FormatZsync.
+const DefaultVersionZsync = "0.6.2"
+
+// DefaultVersionZsync2 is the default version emitted on the
+// `zsync2: ` magic line when Format == FormatZsync2.
+const DefaultVersionZsync2 = "1.0"
+
+// ControlFile is the in-memory representation of a parsed .zsync (or
+// .zsync2) file.
 //
-//   zsync: <version>\n
-//   [Min-Version: ...\n]
-//   [Safe: ...\n]
-//   [Z-Filename: ...\n]
-//   Filename: <fname>\n
-//   [MTime: <RFC822>\n]
-//   Blocksize: <int>\n
-//   Length: <int>\n
-//   Hash-Lengths: <seq>,<rsum_bytes>,<checksum_bytes>\n
-//   URL: <url>\n        (one or more)
-//   [Z-URL: ...\n]      (zero or more)
-//   SHA-1: <hex>\n
-//   [Recompress: ...\n]
-//   [Z-Map2: <n>\n + n * 4 raw bytes]
-//   \n                  (blank line: end of header)
-//   <block-table>       (blocks * (rsum_bytes + checksum_bytes) raw bytes)
+// The classic wire format, as written by Phipps' make.c, is:
 //
-// The block table: per block, big-endian uint32 truncated to its trailing
-// rsum_bytes (so for rsum_bytes=2 you get just the B half of the Rsum), then
-// the leading checksum_bytes of the MD4 of the block.
+//	zsync: <version>\n
+//	[Min-Version: ...\n]
+//	[Safe: ...\n]
+//	[Z-Filename: ...\n]
+//	Filename: <fname>\n
+//	[MTime: <RFC822>\n]
+//	Blocksize: <int>\n
+//	Length: <int>\n
+//	Hash-Lengths: <seq>,<rsum_bytes>,<checksum_bytes>\n
+//	URL: <url>\n        (one or more)
+//	[Z-URL: ...\n]      (zero or more)
+//	SHA-1: <hex>\n
+//	[Recompress: ...\n]
+//	[Z-Map2: <n>\n + n * 4 raw bytes]
+//	\n                  (blank line: end of header)
+//	<block-table>       (blocks * (rsum_bytes + checksum_bytes) raw bytes)
 //
-// Notes:
-//   - Headers are case-sensitive and "Key: value" (note the space).
-//   - The C parser only requires Blocksize and Length to be present.
-//   - "Z-Map2" indicates a transparently-decompressed target served from a
-//     gzip file. This pure-Go MVP does not implement the zmap path.
+// The zsync2 wire format adds two optional headers (`Hash-Algorithm:` and
+// `File-Hash:`) and bumps the magic to `zsync2:`. The block-table layout
+// stays the same; only the meaning of the strong-hash prefix changes
+// (MD4 -> BLAKE3).
 type ControlFile struct {
+	// Format is "zsync" (classic, default) or "zsync2" (BLAKE3-capable).
+	Format string
+
+	// HashAlgorithm is "MD4" (classic, default) or "BLAKE3". Drives the
+	// per-block strong-hash computation and the file-wide File-Hash header.
+	HashAlgorithm string
+
+	// FileHash is the raw bytes of the file-wide strong digest, decoded
+	// from the `File-Hash: <algo>:<hex>` header on zsync2 files. For
+	// classic zsync files this is empty and SHA1Hex carries the digest.
+	FileHash []byte
+
 	Version     string
 	Filename    string
 	ZFilename   string
@@ -73,7 +105,7 @@ type ControlFile struct {
 // BlockChecksum holds the (already-truncated) per-block checksums.
 type BlockChecksum struct {
 	Rsum     Rsum   // A is masked per RsumAMask(rsum_bytes); when rsum_bytes<3 A==0.
-	Checksum []byte // leading checksum_bytes of MD4
+	Checksum []byte // leading checksum_bytes of the strong hash (MD4 or BLAKE3)
 }
 
 // NumBlocks returns the number of blocks the target file decomposes into.
@@ -84,14 +116,22 @@ func (c *ControlFile) NumBlocks() int {
 	return int((c.Length + int64(c.Blocksize) - 1) / int64(c.Blocksize))
 }
 
-// Read parses a .zsync stream.
+// Read parses a .zsync (or .zsync2) stream.
+//
+// The first non-empty line must be either `zsync: <version>` (the classic
+// Phipps wire format) or `zsync2: <version>` (the BLAKE3-capable upgrade
+// described in proposal-blake3). Anything else is rejected with a
+// "not a zsync file"-style error.
 func Read(r io.Reader) (*ControlFile, error) {
 	br := bufio.NewReaderSize(r, 1<<16)
 	cf := &ControlFile{
-		HashLengths: HashLengths{SeqMatches: 1, RsumBytes: 4, ChecksumBytes: 16},
+		Format:        FormatZsync,
+		HashAlgorithm: HashAlgoMD4,
+		HashLengths:   HashLengths{SeqMatches: 1, RsumBytes: 4, ChecksumBytes: 16},
 	}
 
 	var headerBuf strings.Builder
+	first := true
 
 	for {
 		line, err := br.ReadString('\n')
@@ -122,6 +162,27 @@ func Read(r io.Reader) (*ControlFile, error) {
 			return nil, fmt.Errorf("zsync: malformed header (missing space) %q", trimmed)
 		}
 		val := trimmed[colon+2:]
+
+		// The very first header line must be the magic, and the magic must
+		// be either "zsync" or "zsync2". This is the safety property called
+		// out in the proposal: anything else is "not a zsync file".
+		if first {
+			first = false
+			switch key {
+			case "zsync":
+				cf.Format = FormatZsync
+				cf.HashAlgorithm = HashAlgoMD4
+				cf.Version = val
+				continue
+			case "zsync2":
+				cf.Format = FormatZsync2
+				cf.HashAlgorithm = HashAlgoBLAKE3
+				cf.Version = val
+				continue
+			default:
+				return nil, fmt.Errorf("zsync: not a zsync file (first header is %q, expected \"zsync\" or \"zsync2\")", key)
+			}
+		}
 		if err := cf.applyHeader(key, val, br); err != nil {
 			return nil, err
 		}
@@ -129,6 +190,10 @@ func Read(r io.Reader) (*ControlFile, error) {
 
 	cf.HeaderRaw = []byte(headerBuf.String())
 
+	if first {
+		// We never saw any header at all (empty input / blank line only).
+		return nil, fmt.Errorf("zsync: empty header")
+	}
 	if cf.Blocksize <= 0 {
 		return nil, fmt.Errorf("zsync: missing required Blocksize")
 	}
@@ -144,8 +209,11 @@ func Read(r io.Reader) (*ControlFile, error) {
 	cf.Blocks = make([]BlockChecksum, n)
 	rsumBytes := cf.HashLengths.RsumBytes
 	csBytes := cf.HashLengths.ChecksumBytes
-	if rsumBytes < 1 || rsumBytes > 4 || csBytes < 3 || csBytes > 16 {
-		return nil, fmt.Errorf("zsync: nonsensical Hash-Lengths %+v", cf.HashLengths)
+	// Algorithm-aware ceiling on checksum_bytes. MD4 tops out at 16, BLAKE3
+	// at 32. The lower floor (3) is shared.
+	maxCs := StrongHashFullLen(cf.HashAlgorithm)
+	if rsumBytes < 1 || rsumBytes > 4 || csBytes < 3 || csBytes > maxCs {
+		return nil, fmt.Errorf("zsync: nonsensical Hash-Lengths %+v for algorithm %s", cf.HashLengths, cf.HashAlgorithm)
 	}
 	var raw [4]byte
 	for i := 0; i < n; i++ {
@@ -170,8 +238,9 @@ func Read(r io.Reader) (*ControlFile, error) {
 
 func (c *ControlFile) applyHeader(key, val string, br *bufio.Reader) error {
 	switch key {
-	case "zsync":
-		c.Version = val
+	case "zsync", "zsync2":
+		// A duplicate magic line is a malformed file.
+		return fmt.Errorf("zsync: duplicate %q header", key)
 	case "Min-Version":
 		c.MinVersion = val
 	case "Length":
@@ -206,6 +275,54 @@ func (c *ControlFile) applyHeader(key, val string, br *bufio.Reader) error {
 			return fmt.Errorf("zsync: bad Hash-Lengths %q", val)
 		}
 		c.HashLengths = HashLengths{SeqMatches: seq, RsumBytes: rb, ChecksumBytes: cb}
+	case "Hash-Algorithm":
+		// Only valid on zsync2 files; reject for classic.
+		if c.Format != FormatZsync2 {
+			return fmt.Errorf("zsync: Hash-Algorithm header is only allowed on zsync2 files")
+		}
+		switch val {
+		case HashAlgoMD4, HashAlgoBLAKE3:
+			c.HashAlgorithm = val
+		default:
+			return fmt.Errorf("zsync: unknown Hash-Algorithm %q", val)
+		}
+	case "File-Hash":
+		// "<algo>:<hex>" -- only valid on zsync2 files.
+		if c.Format != FormatZsync2 {
+			return fmt.Errorf("zsync: File-Hash header is only allowed on zsync2 files")
+		}
+		sep := strings.IndexByte(val, ':')
+		if sep <= 0 {
+			return fmt.Errorf("zsync: bad File-Hash %q (need <algo>:<hex>)", val)
+		}
+		algo := val[:sep]
+		hexed := val[sep+1:]
+		want := 0
+		switch algo {
+		case HashAlgoMD4:
+			want = 16
+		case HashAlgoBLAKE3:
+			want = 32
+		default:
+			return fmt.Errorf("zsync: unknown File-Hash algorithm %q", algo)
+		}
+		raw, err := hex.DecodeString(hexed)
+		if err != nil {
+			return fmt.Errorf("zsync: bad File-Hash hex: %w", err)
+		}
+		if len(raw) != want {
+			return fmt.Errorf("zsync: File-Hash %s width=%d, want %d", algo, len(raw), want)
+		}
+		c.FileHash = raw
+		// If the file didn't carry an explicit Hash-Algorithm yet, align it
+		// to whatever the File-Hash declares.
+		if c.HashAlgorithm == HashAlgoBLAKE3 && algo == HashAlgoMD4 {
+			// downgrade-compat: zsync2 file but legacy MD4 file-hash; keep
+			// the block-strong-hash at the format default (BLAKE3) but
+			// remember the file-wide algo via the FileHash bytes alone.
+		} else {
+			c.HashAlgorithm = algo
+		}
 	case "SHA-1":
 		c.SHA1Hex = val
 	case "Safe":
@@ -253,17 +370,40 @@ func parseRFC822(s string) (time.Time, error) {
 
 // Write serialises the ControlFile back to a .zsync stream. It writes a
 // header layout matching the C reference's make.c closely enough that
-// `zsync` (the original C client) will accept it.
+// `zsync` (the original C client) will accept it. When Format is
+// FormatZsync2 the upgraded BLAKE3-capable layout is emitted instead;
+// see proposal-blake3.md.
 func (c *ControlFile) Write(w io.Writer) error {
 	bw := bufio.NewWriter(w)
 	writeKV := func(k, v string) {
 		fmt.Fprintf(bw, "%s: %s\n", k, v) //nolint:errcheck // surfaced via bw.Flush below
 	}
 
-	if c.Version == "" {
-		c.Version = "0.6.2"
+	format := c.Format
+	if format == "" {
+		format = FormatZsync
 	}
-	writeKV("zsync", c.Version)
+	zsync2 := format == FormatZsync2
+
+	// Backfill version defaults so a CF built field-by-field still emits a
+	// valid file.
+	if c.Version == "" {
+		if zsync2 {
+			c.Version = DefaultVersionZsync2
+		} else {
+			c.Version = DefaultVersionZsync
+		}
+	}
+	// Same for HashAlgorithm on zsync2: default to BLAKE3.
+	if zsync2 && c.HashAlgorithm == "" {
+		c.HashAlgorithm = HashAlgoBLAKE3
+	}
+
+	if zsync2 {
+		writeKV("zsync2", c.Version)
+	} else {
+		writeKV("zsync", c.Version)
+	}
 	if c.MinVersion != "" {
 		writeKV("Min-Version", c.MinVersion)
 	}
@@ -277,8 +417,14 @@ func (c *ControlFile) Write(w io.Writer) error {
 	writeKV("Length", strconv.FormatInt(c.Length, 10))
 	writeKV("Hash-Lengths", fmt.Sprintf("%d,%d,%d",
 		c.HashLengths.SeqMatches, c.HashLengths.RsumBytes, c.HashLengths.ChecksumBytes))
+	if zsync2 {
+		writeKV("Hash-Algorithm", c.HashAlgorithm)
+	}
 	for _, u := range c.URLs {
 		writeKV("URL", u)
+	}
+	if zsync2 && len(c.FileHash) > 0 {
+		writeKV("File-Hash", fmt.Sprintf("%s:%s", c.HashAlgorithm, hex.EncodeToString(c.FileHash)))
 	}
 	if c.SHA1Hex != "" {
 		writeKV("SHA-1", c.SHA1Hex)
@@ -296,20 +442,43 @@ func (c *ControlFile) Write(w io.Writer) error {
 		}
 		binary.BigEndian.PutUint16(be[0:2], b.Rsum.A)
 		binary.BigEndian.PutUint16(be[2:4], b.Rsum.B)
-		bw.Write(be[4-rsumBytes:])      //nolint:errcheck // surfaced via bw.Flush below
+		bw.Write(be[4-rsumBytes:])     //nolint:errcheck // surfaced via bw.Flush below
 		bw.Write(b.Checksum[:csBytes]) //nolint:errcheck // surfaced via bw.Flush below
 	}
 	return bw.Flush()
 }
 
 // Make builds a ControlFile by reading every byte of src and computing the
-// block table. blocksize must be a power of two; if 0 a sane default is
-// chosen (2048 for files <100MB, 4096 otherwise).
+// block table under the classic MD4 wire format. Equivalent to
+// MakeWithAlgo(..., HashAlgoMD4); see MakeWithAlgo for the algo-aware variant.
+//
+// blocksize must be a power of two; if 0 a sane default is chosen
+// (2048 for files <100MB, 4096 otherwise).
 //
 // urls is the list of HTTP locations from which the *target* file can be
 // fetched as raw bytes. filename and mtime are recorded in the header
 // (filename may be ""; mtime may be the zero time).
 func Make(src io.Reader, totalSize int64, blocksize int, filename string, mtime time.Time, urls []string) (*ControlFile, error) {
+	return MakeWithAlgo(src, totalSize, blocksize, filename, mtime, urls, HashAlgoMD4)
+}
+
+// MakeWithAlgo is the algorithm-aware variant of Make. The algo argument
+// must be HashAlgoMD4 ("MD4") or HashAlgoBLAKE3 ("BLAKE3"); an empty
+// algo string is treated as HashAlgoMD4 for backward compatibility, which
+// keeps callers that predate the format upgrade working unchanged.
+//
+// The returned ControlFile has Format and HashAlgorithm set so a subsequent
+// Write produces the correct on-the-wire layout (classic `zsync: 0.6`
+// header for MD4, new `zsync2: 1.0` header for BLAKE3).
+func MakeWithAlgo(src io.Reader, totalSize int64, blocksize int, filename string, mtime time.Time, urls []string, algo string) (*ControlFile, error) {
+	if algo == "" {
+		algo = HashAlgoMD4
+	}
+	switch algo {
+	case HashAlgoMD4, HashAlgoBLAKE3:
+	default:
+		return nil, fmt.Errorf("zsync: unknown strong-hash algorithm %q", algo)
+	}
 	if blocksize == 0 {
 		if totalSize < 100_000_000 {
 			blocksize = 2048
@@ -321,23 +490,31 @@ func Make(src io.Reader, totalSize int64, blocksize int, filename string, mtime 
 		return nil, fmt.Errorf("zsync: blocksize %d must be a power of two", blocksize)
 	}
 
-	hl := ComputeHashLengths(totalSize, blocksize)
+	hl := ComputeHashLengthsAlgo(totalSize, blocksize, algo)
 	aMask := RsumAMask(hl.RsumBytes)
 
 	buf := make([]byte, blocksize)
 	pad := make([]byte, blocksize)
+
+	// Two file-wide streaming hashers run side-by-side: SHA-1 is kept for
+	// the classic path's `SHA-1:` header (and emitted in addition to
+	// `File-Hash:` on zsync2 when desired), BLAKE3 is only used on the
+	// upgraded path. The cost of running both for the MD4 path is one
+	// SHA-1 over the source bytes, which we already paid.
 	sha := sha1.New() //nolint:gosec // wire format
+	b3 := blake3New()
 
 	var blocks []BlockChecksum
 	var totalRead int64
 	for {
 		n, err := io.ReadFull(src, buf)
 		if n > 0 {
-			// SHA-1 is computed over the unpadded file bytes only.
+			// File-wide hashes are computed over the unpadded file bytes only.
 			sha.Write(buf[:n])
+			_, _ = b3.Write(buf[:n])
 			totalRead += int64(n)
 
-			// Pad the short last block with zeros for rsum/MD4.
+			// Pad the short last block with zeros for rsum/strong-hash.
 			blk := buf
 			if n < blocksize {
 				copy(pad, buf[:n])
@@ -348,9 +525,9 @@ func Make(src io.Reader, totalSize int64, blocksize int, filename string, mtime 
 			}
 			r := CalcRsum(blk)
 			r.A &= aMask
-			md := MD4(blk)
+			strong := strongHash(algo, blk)
 			cs := make([]byte, hl.ChecksumBytes)
-			copy(cs, md[:hl.ChecksumBytes])
+			copy(cs, strong[:hl.ChecksumBytes])
 			blocks = append(blocks, BlockChecksum{Rsum: r, Checksum: cs})
 		}
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -362,14 +539,23 @@ func Make(src io.Reader, totalSize int64, blocksize int, filename string, mtime 
 	}
 
 	cf := &ControlFile{
-		Version:     "0.6.2",
-		Filename:    filename,
-		Blocksize:   blocksize,
-		Length:      totalRead,
-		HashLengths: hl,
-		URLs:        append([]string(nil), urls...),
-		SHA1Hex:     hex.EncodeToString(sha.Sum(nil)),
-		Blocks:      blocks,
+		Blocksize:     blocksize,
+		Length:        totalRead,
+		HashLengths:   hl,
+		URLs:          append([]string(nil), urls...),
+		Blocks:        blocks,
+		Filename:      filename,
+		HashAlgorithm: algo,
+	}
+	switch algo {
+	case HashAlgoMD4:
+		cf.Format = FormatZsync
+		cf.Version = DefaultVersionZsync
+		cf.SHA1Hex = hex.EncodeToString(sha.Sum(nil))
+	case HashAlgoBLAKE3:
+		cf.Format = FormatZsync2
+		cf.Version = DefaultVersionZsync2
+		cf.FileHash = b3.Sum(nil)
 	}
 	if !mtime.IsZero() {
 		cf.MTime = mtime

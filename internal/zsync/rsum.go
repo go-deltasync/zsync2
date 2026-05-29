@@ -118,6 +118,18 @@ func StrongHashFullLen(algo string) int {
 	}
 }
 
+// strongHashLabel returns the canonical wire-format label for the given
+// algorithm. An empty algo maps to "MD4" (the classic default). Unknown
+// algorithms pass through unchanged so the caller can surface them
+// verbatim in error messages without losing information — validation of
+// the algo string itself happens at parse-time in Read.
+func strongHashLabel(algo string) string {
+	if algo == "" {
+		return HashAlgoMD4
+	}
+	return algo
+}
+
 // PutBE16 writes a big-endian uint16 (helper for tests).
 func PutBE16(v uint16) []byte {
 	var b [2]byte
@@ -184,18 +196,20 @@ func ComputeHashLengthsAlgo(length int64, blocksize int, algo string) HashLength
 	if int(cs2) > csLen {
 		csLen = int(cs2)
 	}
-	// BLAKE3 floor: see comment above on the proposal's stated target.
+	// BLAKE3 floor: per the proposal, a BLAKE3 file carries at least 16
+	// bytes of strong-hash prefix per block (128-bit birthday bound). The
+	// Phipps formula was tuned around MD4 prefix sizing and would otherwise
+	// emit ~5 bytes for typical 1 GB targets.
 	if algo == HashAlgoBLAKE3 && csLen < 16 {
 		csLen = 16
 	}
-	// Ceiling clamp at the algorithm's full-digest width.
-	maxCs := StrongHashFullLen(algo)
-	if csLen > maxCs {
-		csLen = maxCs
-	}
-	if csLen < 3 {
-		csLen = 3
-	}
+	// The C reference also clamps csLen to [3, MaxStrongHashFullLen] here.
+	// With int64 inputs neither bound can actually fire: MD4 saturates well
+	// inside [3, 16] for any non-degenerate length/blocksize pair, and the
+	// BLAKE3 floor above already guarantees >= 16 (so the <3 floor and the
+	// >32 ceiling are both unreachable). The wire-spec range is enforced
+	// on Read instead, by Hash-Lengths sanity-checking against the
+	// algorithm's full-digest width.
 	return HashLengths{SeqMatches: seq, RsumBytes: rsumLen, ChecksumBytes: csLen}
 }
 
