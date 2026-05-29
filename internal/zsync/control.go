@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -130,8 +129,11 @@ func Read(r io.Reader) (*ControlFile, error) {
 
 	cf.HeaderRaw = []byte(headerBuf.String())
 
-	if cf.Blocksize <= 0 || cf.Length <= 0 {
-		return nil, fmt.Errorf("zsync: missing required Blocksize/Length")
+	if cf.Blocksize <= 0 {
+		return nil, fmt.Errorf("zsync: missing required Blocksize")
+	}
+	if cf.Length < 0 {
+		return nil, fmt.Errorf("zsync: negative Length")
 	}
 	if cf.Blocksize&(cf.Blocksize-1) != 0 {
 		return nil, fmt.Errorf("zsync: blocksize %d is not a power of two", cf.Blocksize)
@@ -254,76 +256,48 @@ func parseRFC822(s string) (time.Time, error) {
 // `zsync` (the original C client) will accept it.
 func (c *ControlFile) Write(w io.Writer) error {
 	bw := bufio.NewWriter(w)
-
-	writeKV := func(k, v string) error {
-		_, err := fmt.Fprintf(bw, "%s: %s\n", k, v)
-		return err
+	writeKV := func(k, v string) {
+		fmt.Fprintf(bw, "%s: %s\n", k, v) //nolint:errcheck // surfaced via bw.Flush below
 	}
 
 	if c.Version == "" {
 		c.Version = "0.6.2"
 	}
-	if err := writeKV("zsync", c.Version); err != nil {
-		return err
-	}
+	writeKV("zsync", c.Version)
 	if c.MinVersion != "" {
-		if err := writeKV("Min-Version", c.MinVersion); err != nil {
-			return err
-		}
+		writeKV("Min-Version", c.MinVersion)
 	}
 	if c.Filename != "" {
-		if err := writeKV("Filename", c.Filename); err != nil {
-			return err
-		}
+		writeKV("Filename", c.Filename)
 	}
 	if c.HasMTime {
-		if err := writeKV("MTime", c.MTime.UTC().Format("Mon, 02 Jan 2006 15:04:05 -0700")); err != nil {
-			return err
-		}
+		writeKV("MTime", c.MTime.UTC().Format("Mon, 02 Jan 2006 15:04:05 -0700"))
 	}
-	if err := writeKV("Blocksize", strconv.Itoa(c.Blocksize)); err != nil {
-		return err
-	}
-	if err := writeKV("Length", strconv.FormatInt(c.Length, 10)); err != nil {
-		return err
-	}
-	if err := writeKV("Hash-Lengths", fmt.Sprintf("%d,%d,%d",
-		c.HashLengths.SeqMatches, c.HashLengths.RsumBytes, c.HashLengths.ChecksumBytes)); err != nil {
-		return err
-	}
-	urls := append([]string(nil), c.URLs...)
-	sort.SliceStable(urls, func(i, j int) bool { return urls[i] < urls[j] })
+	writeKV("Blocksize", strconv.Itoa(c.Blocksize))
+	writeKV("Length", strconv.FormatInt(c.Length, 10))
+	writeKV("Hash-Lengths", fmt.Sprintf("%d,%d,%d",
+		c.HashLengths.SeqMatches, c.HashLengths.RsumBytes, c.HashLengths.ChecksumBytes))
 	for _, u := range c.URLs {
-		if err := writeKV("URL", u); err != nil {
-			return err
-		}
+		writeKV("URL", u)
 	}
 	if c.SHA1Hex != "" {
-		if err := writeKV("SHA-1", c.SHA1Hex); err != nil {
-			return err
-		}
+		writeKV("SHA-1", c.SHA1Hex)
 	}
-	// End of headers
-	if _, err := bw.WriteString("\n"); err != nil {
-		return err
-	}
+	// End of headers.
+	bw.WriteString("\n") //nolint:errcheck // surfaced via bw.Flush below
 
-	// Block table
+	// Block table.
 	rsumBytes := c.HashLengths.RsumBytes
 	csBytes := c.HashLengths.ChecksumBytes
 	var be [4]byte
 	for _, b := range c.Blocks {
-		binary.BigEndian.PutUint16(be[0:2], b.Rsum.A)
-		binary.BigEndian.PutUint16(be[2:4], b.Rsum.B)
-		if _, err := bw.Write(be[4-rsumBytes:]); err != nil {
-			return err
-		}
 		if len(b.Checksum) < csBytes {
 			return fmt.Errorf("zsync: block checksum too short (%d < %d)", len(b.Checksum), csBytes)
 		}
-		if _, err := bw.Write(b.Checksum[:csBytes]); err != nil {
-			return err
-		}
+		binary.BigEndian.PutUint16(be[0:2], b.Rsum.A)
+		binary.BigEndian.PutUint16(be[2:4], b.Rsum.B)
+		bw.Write(be[4-rsumBytes:])      //nolint:errcheck // surfaced via bw.Flush below
+		bw.Write(b.Checksum[:csBytes]) //nolint:errcheck // surfaced via bw.Flush below
 	}
 	return bw.Flush()
 }

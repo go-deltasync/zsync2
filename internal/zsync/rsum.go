@@ -1,11 +1,3 @@
-// Package zsync implements (the uncompressed subset of) the zsync protocol:
-// .zsync control-file parsing, control-file generation, the rsync-style
-// rolling-checksum block matcher and the HTTP Range based block fetcher.
-//
-// References:
-//   - Colin Phipps, "zsync" (2005). http://zsync.moria.org.uk/paper/
-//   - C reference implementation: https://github.com/probonopd/zsync-curl
-//     (originally http://zsync.moria.org.uk)
 package zsync
 
 import (
@@ -82,6 +74,11 @@ func ComputeHashLengths(length int64, blocksize int) HashLengths {
 	if length > int64(blocksize) {
 		seq = 2
 	}
+	// log(0) is -inf and explodes the sizing formulae; for empty or
+	// degenerate inputs fall back to the smallest legal Hash-Lengths.
+	if length <= 0 {
+		return HashLengths{SeqMatches: 1, RsumBytes: 2, ChecksumBytes: 3}
+	}
 	lnLen := math.Log(float64(length))
 	lnBs := math.Log(float64(blocksize))
 	ln2 := math.Log(2)
@@ -99,12 +96,10 @@ func ComputeHashLengths(length int64, blocksize int) HashLengths {
 	if int(cs2) > csLen {
 		csLen = int(cs2)
 	}
-	if csLen > 16 {
-		csLen = 16
-	}
-	if csLen < 3 {
-		csLen = 3
-	}
+	// The C reference clamps csLen to [3, 16] here. With int64 inputs neither
+	// clamp can actually fire (the formulas saturate well inside that range
+	// for any non-degenerate length/blocksize pair), so the wire-spec range is
+	// enforced on Read by Hash-Lengths sanity-checking instead of here.
 	return HashLengths{SeqMatches: seq, RsumBytes: rsumLen, ChecksumBytes: csLen}
 }
 
