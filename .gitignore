@@ -5,3 +5,7 @@
 /dist/
 *.zsync
 !internal/zsync/testdata/*.zsync
+cover.out
+cover-pkg.out
+cover.txt
+
