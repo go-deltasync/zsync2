@@ -1,90 +1,58 @@
-# go-zsync
+# zsync2
 
-A pure-Go reimplementation of [zsync][zsync-home] — HTTP range-based delta
-file updates using rolling weak checksums plus MD4 per block. Single binary,
-no cgo, builds and runs on Linux, macOS and Windows from the same source.
+[![ci](https://github.com/go-deltasync/zsync2/actions/workflows/ci.yml/badge.svg)](https://github.com/go-deltasync/zsync2/actions/workflows/ci.yml)
+[![compat](https://github.com/go-deltasync/zsync2/actions/workflows/compat.yml/badge.svg)](https://github.com/go-deltasync/zsync2/actions/workflows/compat.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-deltasync/zsync2.svg)](https://pkg.go.dev/github.com/go-deltasync/zsync2)
+[![License: BSD 3-Clause](https://img.shields.io/badge/license-BSD%203--Clause-blue.svg)](LICENSE)
 
-> zsync is an rsync-like protocol designed by Colin Phipps (2005). The server
-> publishes a small `.zsync` control file listing checksums for every block of
-> the target file. A client that already has an older version of the target
-> uses the control file to figure out which blocks it can reuse and fetches
-> only the changed blocks via HTTP `Range:` requests. It is the protocol
-> behind AppImage's delta updates.
+`zsync2` is a pure-Go reimplementation of [zsync][zsync-home], the rsync-style
+delta-update protocol designed by Colin Phipps in 2005. The library lets an
+HTTP client download only the bytes that actually differ between a local
+"seed" file and a newer "target" file published by a vanilla HTTP server.
 
-## Status
+It ships as a small, dependency-light library (`github.com/go-deltasync/zsync2/internal/zsync`)
+plus two CLIs:
 
-Phase 1 / MVP. Implemented:
+| binary           | role                                              |
+| ---------------- | ------------------------------------------------- |
+| `gozsyncmake`    | server side &mdash; emit a `.zsync` control file  |
+| `gozsync`        | client side &mdash; reconstruct a target file     |
 
-- [x] `.zsync` parser (`internal/zsync.Read`)
-- [x] `.zsync` writer (`internal/zsync.Make` + `ControlFile.Write`)
-- [x] Rolling weak checksum (Phipps' Adler-style `a`/`b` pair) with the
-      byte-wise incremental update rule, verified by a property test against
-      a from-scratch recompute
-- [x] MD4 per-block strong checksum (via `golang.org/x/crypto/md4`)
-- [x] SHA-1 of the whole file
-- [x] Per-file `Hash-Lengths` sizing matching the C reference's `make.c`
-- [x] Seed-file matcher (find common blocks via rolling-checksum sliding
-      window, MD4-verify, copy into output buffer)
-- [x] HTTP fetcher for missing block ranges. Works against both
-      `206 Partial Content` (e.g. nginx, Go's `http.ServeContent`) and
-      `200 OK` (e.g. Python's `http.server`, which ignores Range).
-- [x] `gozsync` client and `gozsyncmake` maker CLIs
-- [x] End-to-end test: 256 KB file with mutated seed reconstructed byte-exact
-      over an in-process HTTP server
-- [x] 10 MB smoke test against `python3 -m http.server`: 3 mutated regions
-      in the seed, exactly 3 blocks fetched, output byte-identical to the
-      target.
-- [x] Cross-compile verified for `linux/amd64`, `linux/arm64`,
-      `windows/amd64`.
+The on-the-wire `.zsync` format is bit-compatible with the C reference, so
+files emitted by `gozsyncmake` are accepted by upstream `zsync`, and files
+emitted by upstream `zsyncmake` are accepted by `gozsync`. A dedicated
+integration test, gated by the `compat` build tag, pins that down.
 
-Intentionally out of scope for this MVP (documented gaps):
+## How it compares
 
-- [ ] `Z-Map2` / `Recompress`: the path where the target is gzip-compressed
-      and the `.zsync` indexes the *uncompressed* stream so the client can
-      reuse a previous compressed copy. The maker simply does not emit
-      Z-Map2 and the client errors out if it encounters one.
-- [ ] `seq_matches == 2` filtering. We *parse* control files that declare
-      `seq_matches = 2` (they're the norm for files larger than one block)
-      and *find* matches correctly — we just skip the "next block must also
-      match" optimisation and rely on MD4 to weed out the extra weak-checksum
-      hits. Throughput is fine on the smoke-test scale; for large files this
-      is a TODO.
-- [ ] Multi-range / `multipart/byteranges` batching. We issue one HTTP GET
-      per contiguous missing-block run. A `parseMultipartByteRanges` helper
-      is already wired up for when we want to start batching.
-- [ ] Multi-URL failover, resumable on-disk staging, RFC 822 mtime
-      preservation on the output file.
-- [ ] Conditional GET / `If-Modified-Since`.
+| Implementation                                                    | Language | OS support       |
+| ----------------------------------------------------------------- | -------- | ---------------- |
+| [Colin Phipps' `zsync`][zsync-home]                               | C        | Linux, BSD       |
+| [`zsync-curl`](https://github.com/probonopd/zsync-curl)           | C        | Linux            |
+| [`AppImageCommunity/zsync2`](https://github.com/AppImageCommunity/zsync2) | C++      | Linux            |
+| **this project**                                                  | Go       | Linux, macOS, Windows |
 
-The bits we *do* implement are bit-compatible with the C reference's
-`.zsync` files, modulo unimplemented headers — control files written by the
-C `zsyncmake` are read fine, and our control files are accepted by clients
-expecting the canonical layout.
+This is *not* a drop-in CLI replacement &mdash; option flags and exit codes
+differ &mdash; but it speaks the same wire format. Library users get a clean
+package surface (`Read`, `Write`, `Make`, `Matcher`, `FetchClient`) that
+exposes the protocol without dragging in any C code.
 
-## Relationship to upstream `zsync` and `zsync2`
-
-- **C reference**: <https://github.com/probonopd/zsync-curl> (originally
-  <http://zsync.moria.org.uk>). Colin Phipps, Artistic License v2. This is
-  the canonical implementation that defines the wire format. `go-zsync`
-  reads its `make.c`, `rsum.c` and `zsync.c` as ground truth.
-- **C++ rewrite**: <https://github.com/AppImageCommunity/zsync2>. Modern C++
-  rewrite with a library + standalone tools. Linux-only in practice.
-- **Other Go**: <https://github.com/cph6/zsync> is an unrelated Go port by a
-  different author. We did not consult it; this implementation is derived
-  directly from the C source and the 2005 paper.
-
-`go-zsync` is *not* a drop-in CLI replacement for either: the option flags
-and exit codes don't match. It is meant as a clean, portable, embeddable
-library (`internal/zsync`) plus thin CLIs.
+There is no `cgo`. There is no `fopencookie` or other glibc-specific call.
+The package builds and runs from the same source on Linux, macOS and
+Windows, and cross-compiles cleanly to ARM via `GOOS`/`GOARCH`.
 
 ## Install
 
 ```sh
-go install github.com/tannevaled/go-zsync/cmd/gozsync@latest
-go install github.com/tannevaled/go-zsync/cmd/gozsyncmake@latest
+go install github.com/go-deltasync/zsync2/cmd/gozsync@latest
+go install github.com/go-deltasync/zsync2/cmd/gozsyncmake@latest
 ```
 
-Or from a checkout:
+Pre-built binaries for `linux/amd64`, `linux/arm64`, `darwin/amd64`,
+`darwin/arm64`, `windows/amd64` and `windows/arm64` are attached to each
+GitHub release.
+
+From a checkout:
 
 ```sh
 go build ./...
@@ -92,29 +60,59 @@ go build ./...
 
 ## Usage
 
-### Server side: make a `.zsync`
+### Server side: emit a `.zsync` control file
 
 ```sh
 gozsyncmake -u https://example.com/dist/firmware-2.bin firmware-2.bin
-# -> firmware-2.bin.zsync
+# wrote firmware-2.bin.zsync (4096 blocks of 2048 bytes, total 8388608 bytes)
 ```
 
-Then serve `firmware-2.bin` and `firmware-2.bin.zsync` from any HTTP
-server that supports byte ranges (nginx, caddy, S3, GitHub Releases...).
+Then publish `firmware-2.bin` and `firmware-2.bin.zsync` from any HTTP
+server that supports byte-range requests (`nginx`, `caddy`, Amazon S3,
+GitHub Releases, the `python3 -m http.server` test server &mdash; all
+work).
 
-### Client side: fetch only the changed bytes
+Flags:
+
+```
+-b int          block size in bytes; must be a power of two (default: auto)
+-o string       output .zsync filename (default: <input>.zsync)
+-f string       target filename to embed in the .zsync (default: basename of input)
+-u string       URL the client should fetch the target from (may be repeated)
+```
+
+### Client side: fetch only the bytes that changed
 
 ```sh
 gozsync -i firmware-1.bin -o firmware-2.bin \
   https://example.com/dist/firmware-2.bin.zsync
+# zsync: target "firmware-2.bin", 4096 blocks of 2048 bytes (8388608 bytes total)
+# seed scan: matched 4093/4096 blocks in 12ms
+# need to fetch 3 blocks (6144 bytes) in 1 ranges
+# fetching from https://example.com/dist/firmware-2.bin
+# wrote firmware-2.bin (8388608 bytes)
 ```
 
-`firmware-1.bin` is your existing older version; the client scans it for
-blocks that also appear in the new target, fetches only the missing blocks,
-and writes the reconstructed `firmware-2.bin`. Without `-i seed` the client
-just downloads everything via Range requests (verifying each block's MD4).
+The client opens the local seed file (the older version of the target),
+slides a rolling-checksum window over every byte position, MD4-verifies
+each candidate match against the control-file's block table, and copies
+matched blocks straight from the seed into the output buffer. Anything
+the seed cannot supply is fetched from the server with HTTP `Range`
+requests and MD4-verified again before acceptance. A final SHA-1 check
+over the whole reconstructed file rejects partial-corruption.
 
-### Smoke test (the one in the test suite, but with CLIs)
+Flags:
+
+```
+-i string       local seed file (older version of the target) — optional
+-o string       output path (default: Filename: from .zsync, then basename of URL)
+-q              quiet: suppress progress output
+```
+
+If `-i` is omitted the client downloads everything via Range requests
+(verifying each block's MD4) &mdash; useful as a sanity check.
+
+### End-to-end smoke test
 
 ```sh
 mkdir -p srv && dd if=/dev/urandom of=srv/big.bin bs=1m count=10
@@ -123,27 +121,173 @@ printf 'MUTATED' | dd of=seed.bin bs=1 seek=5000000 count=7 conv=notrunc
 gozsyncmake -u big.bin -o srv/big.bin.zsync srv/big.bin
 (cd srv && python3 -m http.server 8765) &
 gozsync -i seed.bin -o new.bin http://127.0.0.1:8765/big.bin.zsync
-diff srv/big.bin new.bin   # empty -> reconstruction is byte-exact
+diff srv/big.bin new.bin       # empty: reconstruction is byte-exact
 ```
 
-## Why MD4 in 2026?
+## How it works
 
-MD4 is broken for collision resistance and we know it. The zsync wire
-format requires MD4 (because Colin Phipps designed it in 2005 and it's
-fast). The threat model here is *integrity against accidental corruption
-in the seed file*, not authentication — the authoritative integrity check
-is the file-wide SHA-1 (also weak, but slightly less so). For a security
-review:
+```
+                       +-----------------------+
+                       |  target.bin (server)  |
+                       +----------+------------+
+                                  |
+                gozsyncmake / zsyncmake (server-side)
+                                  |
+                                  v
+        +-------------------------+--------------------------+
+        |              target.bin.zsync (.zsync)             |
+        |                                                    |
+        | header                                             |
+        |   Filename / Blocksize / Length / Hash-Lengths     |
+        |   URL: ...   SHA-1: <full-file digest>             |
+        | block table                                        |
+        |   per block: weak rolling rsum + leading MD4 bytes |
+        +-------------------------+--------------------------+
+                                  |
+                          (published over HTTP)
+                                  |
+       +---------- client (gozsync / zsync) ----------+
+       |                                              |
+       v                                              v
+   seed.bin                                target.bin.zsync (parsed)
+       |                                              |
+       v                                              |
+  +---------+   slide rolling rsum window  +-------------------+
+  | matcher | -----------------------------|   block table     |
+  +----+----+         (one byte at a time) +---------+---------+
+       |  hit on hashRsum ?                          |
+       |  yes -> MD4-verify -> copy block to output  |
+       |  no  -> mark block as missing               |
+       v                                             v
+  output buffer                              HTTP Range request
+  (filled in-place)                                  |
+       ^                                             v
+       |                                       MD4 verify block
+       +---------------------------------------------+
+                                                     |
+                                       SHA-1 the whole reconstructed file
+                                                     |
+                                                     v
+                                              target.bin (client)
+```
 
-- An attacker who controls the *content served at the URL in `URL:`* can
-  obviously serve whatever they want; the `.zsync` is the trust anchor.
-- An attacker who controls the `.zsync` can swap in their own URL.
-- MD4 collisions can let an attacker craft a *seed file* that the matcher
-  accepts as containing a block of the target; the file-wide SHA-1 at the
-  end will catch it. Don't trust the seed otherwise.
+The block table associates every fixed-size block of the target with two
+checksums:
 
-For new protocols, use BLAKE3. For zsync, use MD4 because that's the
+- a weak **rolling rsum** (Phipps' Adler-style `a`/`b` pair) which the
+  client can update in O(1) as it slides its window byte-by-byte across
+  the seed file; and
+- the leading bytes of an **MD4** digest of the block, which the client
+  uses to confirm any candidate match the rolling rsum proposed.
+
+The choice of (rsum-bytes, checksum-bytes, seq_matches) is sized per file
+to keep both the on-disk control file small and the expected false-positive
+rate well below 1 per block. The function `ComputeHashLengths` in
+[`internal/zsync/rsum.go`](internal/zsync/rsum.go) reproduces the C
+reference's sizing formula exactly.
+
+## Cross-platform / portability
+
+The codebase intentionally avoids any system-specific dependency:
+
+- **No cgo.** `CGO_ENABLED=0 go build ./...` produces fully static binaries
+  on every supported OS. The release workflow builds and ships them.
+- **No `fopencookie`, `funopen`, mmap or sendfile.** The matcher uses an
+  ordinary `io.Reader` and an in-memory output buffer.
+- **No platform-conditional files.** Every `.go` source in this repo
+  compiles on every supported `GOOS`/`GOARCH` combination.
+
+Tested matrix in CI: `linux`, `macos`, `windows` × `go 1.22`, `go 1.23`.
+
+## Compatibility with upstream zsync / zsync2
+
+The on-the-wire `.zsync` format implemented here is exercised against
+Colin Phipps' canonical C `zsync` (the one packaged as `zsync` in Debian,
+Ubuntu and Homebrew) by a dedicated integration test suite:
+[`internal/zsync/compat_test.go`](internal/zsync/compat_test.go). It is
+gated by the `compat` build tag, so a plain `go test ./...` doesn't depend
+on an external binary; CI runs it through the
+[`compat.yml`](.github/workflows/compat.yml) workflow which installs
+`zsync` from `apt` before invoking:
+
+```sh
+go test -tags=compat ./internal/zsync/...
+```
+
+The compat suite covers four directions:
+
+1. **upstream make &rarr; our read.** A `.zsync` produced by C `zsyncmake`
+   is parsed by our `Read` and the resulting block table is asserted equal
+   to the one our `Make` computes from the same input.
+2. **our make &rarr; upstream apply.** Our `Make` writes a `.zsync` that
+   is then handed to the upstream C `zsync` client, which reconstructs the
+   target file byte-identically.
+3. **upstream make &rarr; our apply.** The mirror image: upstream's
+   `.zsync` is handed to our matcher + fetcher, which reconstructs the
+   target byte-identically.
+4. **round-trip parse.** Parse upstream's `.zsync`, re-serialise it with
+   our `Write`, parse it again, and assert no drift in headers, block
+   table or SHA-1.
+
+The [AppImageCommunity C++ zsync2](https://github.com/AppImageCommunity/zsync2)
+reads and writes the same wire format as Phipps' C; testing against the C
+binary therefore implicitly covers it. If you want to test against the C++
+implementation specifically, build it from source in the
+[`compat.yml`](.github/workflows/compat.yml) workflow's apt step.
+
+## Security note
+
+The zsync wire format requires **MD4** and **SHA-1**, both of which are
+broken for collision resistance. The threat model here is integrity
+against accidental corruption of the seed file, not authentication: the
+real trust anchor is whoever serves the `.zsync` control file. Concretely:
+
+- An attacker who controls the content served at the `URL:` in the
+  `.zsync` can obviously serve whatever they want. The `.zsync` is the
+  trust anchor.
+- An attacker who controls the `.zsync` can swap in their own `URL:`.
+- MD4 collisions could let an attacker craft a *seed* file whose blocks
+  the matcher accepts as matching the target. The file-wide SHA-1 at the
+  end will catch that.
+
+For a new protocol, use BLAKE3. For zsync, use MD4 because that's the
 protocol.
+
+## Project scope and known gaps
+
+The current release covers the uncompressed path of the zsync protocol in
+full. Intentionally not implemented:
+
+- **`Z-Map2` / `Recompress`.** This is the path where the target is
+  served gzip-compressed and the `.zsync` indexes the *uncompressed*
+  stream so the client can reuse a previous gzip copy. The maker doesn't
+  emit `Z-Map2` and the client errors out cleanly if it encounters one.
+- **`seq_matches == 2` filtering.** We parse `.zsync` files that declare
+  `seq_matches == 2` (the default for files larger than one block) and
+  match correctly; we simply skip the "next block must also match"
+  optimisation and rely on MD4 to filter out the extra weak-checksum
+  hits. Throughput is fine for typical AppImage-sized targets; truly huge
+  files will see more MD4 work than the C reference.
+- **`multipart/byteranges` batching.** We issue one HTTP `GET` per
+  contiguous run of missing blocks. A `parseMultipartByteRanges` helper
+  is in place for when we want to batch.
+- **Multi-URL failover, resumable on-disk staging, RFC 822 `MTime`
+  preservation on the output file, conditional GET.**
+
+## Contributing
+
+Patches, bug reports and compat-test cases are very welcome. Before
+sending a PR:
+
+```sh
+go vet ./...
+go test -race ./...
+go test -tags=compat ./...   # requires `zsync` from apt / brew / pkgsrc
+```
+
+The `internal/zsync` package is held to **&ge;99% line coverage** by CI;
+new code should keep it there. Any change to header parsing or block-table
+serialisation must keep all four compat-test scenarios green.
 
 ## License
 
