@@ -76,9 +76,10 @@ Flags:
 
 ```
 -b int          block size in bytes; must be a power of two (default: auto)
--o string       output .zsync filename (default: <input>.zsync)
--f string       target filename to embed in the .zsync (default: basename of input)
+-o string       output control filename (default: <input>.zsync or <input>.zsync2)
+-f string       target filename to embed in the control file (default: basename of input)
 -u string       URL the client should fetch the target from (may be repeated)
+   --format     wire format: "zsync" (classic, MD4+SHA-1; default) or "zsync2" (BLAKE3)
 ```
 
 ### Client side: fetch only the bytes that changed
@@ -237,10 +238,11 @@ implementation specifically, build it from source in the
 
 ## Security note
 
-The zsync wire format requires **MD4** and **SHA-1**, both of which are
-broken for collision resistance. The threat model here is integrity
-against accidental corruption of the seed file, not authentication: the
-real trust anchor is whoever serves the `.zsync` control file. Concretely:
+The classic `zsync: 0.6` wire format requires **MD4** and **SHA-1**, both
+of which are broken for collision resistance. The threat model there is
+integrity against accidental corruption of the seed file, not
+authentication: the real trust anchor is whoever serves the `.zsync`
+control file. Concretely:
 
 - An attacker who controls the content served at the `URL:` in the
   `.zsync` can obviously serve whatever they want. The `.zsync` is the
@@ -248,10 +250,20 @@ real trust anchor is whoever serves the `.zsync` control file. Concretely:
 - An attacker who controls the `.zsync` can swap in their own `URL:`.
 - MD4 collisions could let an attacker craft a *seed* file whose blocks
   the matcher accepts as matching the target. The file-wide SHA-1 at the
-  end will catch that.
+  end will catch that &mdash; *unless* the attacker also crafts a SHA-1
+  collision for the whole reconstructed file (more expensive, but no
+  longer rocket science).
 
-For a new protocol, use BLAKE3. For zsync, use MD4 because that's the
-protocol.
+For deployments that want a modern security margin, pass
+`--format=zsync2` to `gozsyncmake`. The
+[`zsync2: 1.0` wire format][proposal-blake3] uses **BLAKE3** for both the
+per-block strong hash and the file-wide digest, replaces the `SHA-1:`
+header with a self-describing `File-Hash: BLAKE3:<hex>` line, and bumps
+the magic line so old `zsync: 0.6` parsers reject it cleanly. The
+default stays `--format=zsync` for the year-one transition window; the
+in-tree `gozsync` client reads both formats transparently.
+
+[proposal-blake3]: https://go-deltasync.github.io/zsync2/proposal-blake3/
 
 ## Project scope and known gaps
 
