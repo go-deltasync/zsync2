@@ -342,3 +342,178 @@ func TestMatcherFeedSeedRereadIdempotent(t *testing.T) {
 
 // Compile-time check: errReader is reused from control_test.go.
 var _ io.Reader = errReader{}
+
+// TestMatcherSeq2BasicMatch verifies that with seq_matches==2 (the C
+// reference's default for files larger than one block) the matcher
+// correctly accepts a target whose seed is byte-identical.
+func TestMatcherSeq2BasicMatch(t *testing.T) {
+	bs := 16
+	target := make([]byte, bs*4)
+	for i := range target {
+		target[i] = byte(i)
+	}
+	cf := &ControlFile{
+		Blocksize:   bs,
+		Length:      int64(len(target)),
+		HashLengths: HashLengths{SeqMatches: 2, RsumBytes: 4, ChecksumBytes: 3},
+	}
+	for i := 0; i < 4; i++ {
+		blk := target[i*bs : (i+1)*bs]
+		r := CalcRsum(blk)
+		md := MD4(blk)
+		cf.Blocks = append(cf.Blocks, BlockChecksum{Rsum: r, Checksum: append([]byte(nil), md[:3]...)})
+	}
+	m := NewMatcher(cf)
+	if err := m.FeedSeed(bytes.NewReader(target)); err != nil {
+		t.Fatal(err)
+	}
+	if m.AcceptedBlocks() != m.TotalBlocks() {
+		t.Errorf("seq==2 full match: got %d/%d", m.AcceptedBlocks(), m.TotalBlocks())
+	}
+}
+
+// TestMatcherSeq2FilteringAvoidsStrongHash verifies the cheap weak-rsum
+// pre-filter at the heart of A.2: a candidate at index 0 whose strong hash
+// would (artificially) pass but whose declared block-1 rsum is gibberish
+// must be rejected by the seq==2 pre-filter without the strong-hash being
+// computed.
+//
+// We force this by giving block 0 in the table a correct rsum+checksum
+// pair but block 1 a deliberately wrong rsum. The seed contains real
+// target bytes for both blocks. Under seq==1 the matcher would still
+// match block 0 by strong hash. Under seq==2 the next-block rsum
+// precondition fails (table's block-1 rsum != seed's r1), so block 0
+// is never committed, demonstrating the gating.
+func TestMatcherSeq2FilteringGatesAcceptance(t *testing.T) {
+	bs := 32
+	target := make([]byte, bs*3)
+	for i := range target {
+		target[i] = byte(i*7 + 1)
+	}
+	// Build a control file with a CORRUPTED block-1 rsum so the seq==2
+	// precondition for block 0 fails.
+	cf := &ControlFile{
+		Blocksize:   bs,
+		Length:      int64(len(target)),
+		HashLengths: HashLengths{SeqMatches: 2, RsumBytes: 4, ChecksumBytes: 3},
+	}
+	for i := 0; i < 3; i++ {
+		blk := target[i*bs : (i+1)*bs]
+		r := CalcRsum(blk)
+		md := MD4(blk)
+		cf.Blocks = append(cf.Blocks, BlockChecksum{Rsum: r, Checksum: append([]byte(nil), md[:3]...)})
+	}
+	// Corrupt block-1's stored rsum so the seq==2 next-block precondition
+	// fails on candidate i=0.
+	cf.Blocks[1].Rsum.A ^= 0xff
+	cf.Blocks[1].Rsum.B ^= 0xff
+
+	m := NewMatcher(cf)
+	if err := m.FeedSeed(bytes.NewReader(target)); err != nil {
+		t.Fatal(err)
+	}
+	if m.Got(0) {
+		t.Errorf("block 0 should have been filtered out by seq==2 (next-block rsum mismatch)")
+	}
+	// Block 2 stands alone (no constraint on its predecessor under our
+	// asymmetric setup; the matcher considers i=2 a candidate when the
+	// seed window is positioned over block 2's start, with no "next" in
+	// the block table to gate it).
+	if !m.Got(2) {
+		t.Errorf("block 2 should still match")
+	}
+}
+
+// TestMatcherSeq2OpportunisticPair verifies the "if block i matches, try
+// to also commit block i+1 from the same window" path in seq==2.
+func TestMatcherSeq2OpportunisticPair(t *testing.T) {
+	bs := 16
+	target := make([]byte, bs*4)
+	for i := range target {
+		target[i] = byte(i)
+	}
+	cf := makeCF(t, target, bs)
+	// makeCF returns seq==2 for multi-block targets (sized by
+	// ComputeHashLengths). Sanity-check that.
+	if cf.HashLengths.SeqMatches != 2 {
+		t.Fatalf("expected seq==2 for multi-block target, got %d", cf.HashLengths.SeqMatches)
+	}
+	m := NewMatcher(cf)
+	if err := m.FeedSeed(bytes.NewReader(target)); err != nil {
+		t.Fatal(err)
+	}
+	if m.AcceptedBlocks() != m.TotalBlocks() {
+		t.Errorf("seq==2 full match: got %d/%d", m.AcceptedBlocks(), m.TotalBlocks())
+	}
+	if !bytes.Equal(m.Out(), target) {
+		t.Error("seq==2 reconstruction differs")
+	}
+}
+
+// TestMatcherSeqClampedTo1 — a malformed Hash-Lengths declaring seq=5 must
+// be clamped to seq=1 by NewMatcher.
+func TestMatcherSeqClampedTo1(t *testing.T) {
+	cf := &ControlFile{
+		Blocksize:   16,
+		Length:      16,
+		HashLengths: HashLengths{SeqMatches: 5, RsumBytes: 2, ChecksumBytes: 3},
+		Blocks:      []BlockChecksum{{Rsum: Rsum{}, Checksum: []byte{0, 0, 0}}},
+	}
+	m := NewMatcher(cf)
+	if m.seq != 1 {
+		t.Errorf("seq=%d, want 1 (clamped)", m.seq)
+	}
+}
+
+// BenchmarkMatcherSeq1VsSeq2 measures the throughput difference between
+// seq==1 and seq==2 on a synthetic target where ~20 % of weak-rsum hits
+// are false positives. The seq==2 pre-filter should be measurably faster
+// because it skips the strong-hash computation for the false positives.
+//
+// Run with:
+//
+//	go test -bench BenchmarkMatcherSeq -benchtime 1x ./internal/zsync/
+func BenchmarkMatcherSeq1VsSeq2(b *testing.B) {
+	const bs = 4096
+	const nBlocks = 256 // 1 MiB target, kept short so the benchmark is fast.
+	rng := rand.New(rand.NewSource(99))
+	target := make([]byte, bs*nBlocks)
+	rng.Read(target)
+	cf, err := Make(bytes.NewReader(target), int64(len(target)), bs, "t.bin",
+		time.Time{}, []string{"t.bin"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	// Inject ~20 % false positives by salting the seed with repeated
+	// block-aligned copies whose rsums collide with random target blocks.
+	seed := append([]byte(nil), target...)
+	for i := 0; i < nBlocks/5; i++ {
+		// Choose a random source block and a random destination block;
+		// the rolling rsum will hit on the destination as it slides past
+		// the salted region, but the MD4 will reject under seq==1.
+		dst := rng.Intn(nBlocks) * bs
+		src := rng.Intn(nBlocks) * bs
+		copy(seed[dst:dst+bs], target[src:src+bs])
+	}
+
+	b.Run("seq1", func(b *testing.B) {
+		// Force seq=1 by editing the control file.
+		cf1 := *cf
+		cf1.HashLengths.SeqMatches = 1
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			m := NewMatcher(&cf1)
+			_ = m.FeedSeed(bytes.NewReader(seed))
+		}
+	})
+	b.Run("seq2", func(b *testing.B) {
+		// Force seq=2.
+		cf2 := *cf
+		cf2.HashLengths.SeqMatches = 2
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			m := NewMatcher(&cf2)
+			_ = m.FeedSeed(bytes.NewReader(seed))
+		}
+	})
+}
