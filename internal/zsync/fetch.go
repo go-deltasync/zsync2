@@ -1,6 +1,7 @@
 package zsync
 
 import (
+	"bytes"
 	"crypto/sha1" //nolint:gosec // wire format
 	"encoding/hex"
 	"fmt"
@@ -142,6 +143,30 @@ func VerifySHA1(cf *ControlFile, data []byte) error {
 	got := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(got, cf.SHA1Hex) {
 		return fmt.Errorf("zsync: SHA-1 mismatch: got %s, want %s", got, cf.SHA1Hex)
+	}
+	return nil
+}
+
+// VerifyFileHash checks the reconstructed buffer against the file-wide
+// strong digest carried by the control file. For zsync2 files this is the
+// FileHash field decoded from the `File-Hash: <algo>:<hex>` header; for
+// classic zsync files it's the SHA-1 stored in SHA1Hex.
+//
+// Returns nil when the control file carries no file-wide digest at all
+// (matching VerifySHA1's "no-op if empty" contract).
+func VerifyFileHash(cf *ControlFile, data []byte) error {
+	if len(cf.FileHash) == 0 {
+		// No File-Hash header: fall back to the legacy SHA-1 path.
+		return VerifySHA1(cf, data)
+	}
+	algo := cf.HashAlgorithm
+	if algo == "" {
+		algo = HashAlgoMD4
+	}
+	got := strongHash(algo, data)
+	if !bytes.Equal(got, cf.FileHash) {
+		return fmt.Errorf("zsync: %s file-hash mismatch: got %s, want %s",
+			strongHashLabel(algo), hex.EncodeToString(got), hex.EncodeToString(cf.FileHash))
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package zsync
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -75,13 +76,14 @@ func (m *Matcher) AcceptedBlocks() int { return m.nGot }
 func (m *Matcher) TotalBlocks() int { return len(m.got) }
 
 // FeedSeed scans the given seed reader from start to EOF, searching for any
-// blocks that also occur in the target. Found blocks are MD4-verified
-// against the control file's checksum and written into m.out.
+// blocks that also occur in the target. Found blocks are strong-hash
+// verified against the control file's checksum and written into m.out.
 //
 // The implementation maintains a sliding window of one block, recomputing
 // the rolling checksum byte-by-byte. When the rolling checksum's hash hits
-// a candidate, we MD4 the window and accept iff it matches the target
-// block's stored MD4 prefix.
+// a candidate, we strong-hash the window (under the control file's
+// declared algorithm) and accept iff the leading checksum_bytes match the
+// target block's stored prefix.
 func (m *Matcher) FeedSeed(r io.Reader) error {
 	bs := m.blocksize
 	// Nothing to match against (empty target file): drain the seed and
@@ -128,8 +130,9 @@ func (m *Matcher) FeedSeed(r io.Reader) error {
 				if m.got[int(idx)] {
 					continue
 				}
-				// Verify MD4 prefix
-				md := MD4(seed[x:end])
+				// Verify the strong-hash prefix under the algorithm declared
+				// by the control file (MD4 for classic, BLAKE3 for zsync2).
+				md := strongHash(m.cf.HashAlgorithm, seed[x:end])
 				if bytes.Equal(md[:m.cf.HashLengths.ChecksumBytes], bc.Checksum) {
 					m.acceptBlock(int(idx), seed[x:end])
 				}
@@ -188,7 +191,7 @@ func (m *Matcher) MissingRanges() [][2]int {
 	return out
 }
 
-// AcceptDownloadedBlock checks an MD4-verifies a single block fetched from
+// AcceptDownloadedBlock strong-hash-verifies a single block fetched from
 // the remote, then stores it. Used after an HTTP Range response.
 //
 // data must be exactly blocksize bytes; the last block in the file is
@@ -203,9 +206,9 @@ func (m *Matcher) AcceptDownloadedBlock(idx int, data []byte) error {
 		return errors.New("zsync: downloaded block has wrong size")
 	}
 	bc := m.cf.Blocks[idx]
-	md := MD4(data)
+	md := strongHash(m.cf.HashAlgorithm, data)
 	if !bytes.Equal(md[:m.cf.HashLengths.ChecksumBytes], bc.Checksum) {
-		return errors.New("zsync: downloaded block failed MD4 verification")
+		return fmt.Errorf("zsync: downloaded block failed %s verification", strongHashLabel(m.cf.HashAlgorithm))
 	}
 	m.acceptBlock(idx, data)
 	return nil
