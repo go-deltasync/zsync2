@@ -30,7 +30,7 @@ func NewFetchClient() *FetchClient {
 	return &FetchClient{
 		HTTP:                http.DefaultClient,
 		MaxRangesPerRequest: 50,
-		UserAgent:           "gozsync/0.1 (+https://github.com/tannevaled/go-zsync)",
+		UserAgent:           "gozsync/0.1 (+https://github.com/go-deltasync/zsync2)",
 	}
 }
 
