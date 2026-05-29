@@ -1,0 +1,7 @@
+/gozsync
+/gozsyncmake
+/gozsync.exe
+/gozsyncmake.exe
+/dist/
+*.zsync
+!internal/zsync/testdata/*.zsync
