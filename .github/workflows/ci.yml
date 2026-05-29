@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} / go${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ["1.22", "1.23"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Show Go version
+        run: go version
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          go test -race -coverprofile=cover.out ./...
+          go tool cover -func=cover.out | tee cover.txt
+          # The CLIs in cmd/ are thin wrappers around the internal package
+          # and intentionally have no unit tests; we enforce >=99% coverage
+          # on the library (internal/zsync) only, which is where the
+          # protocol-correctness logic lives.
+          pkg_cov=$(go test -coverprofile=cover-pkg.out ./internal/zsync 2>/dev/null && \
+                    go tool cover -func=cover-pkg.out | tail -n 1 | awk '{print $3}' | tr -d '%')
+          echo "internal/zsync coverage: ${pkg_cov}%"
+          awk -v t="$pkg_cov" 'BEGIN { exit !(t+0 >= 99.0) }' || {
+            echo "::error::internal/zsync coverage ${pkg_cov}% < 99%"; exit 1; }
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cover-${{ matrix.os }}-go${{ matrix.go }}
+          path: cover.out
+          if-no-files-found: warn
