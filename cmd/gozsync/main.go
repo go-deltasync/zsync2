@@ -9,7 +9,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,56 +18,72 @@ import (
 	"time"
 
 	"github.com/go-deltasync/zsync2/internal/zsync"
+	"github.com/spf13/cobra"
 )
 
 func main() {
 	var (
-		seedPath = flag.String("i", "", "local seed file (older version of the target) — optional")
-		outPath  = flag.String("o", "", "output path (default: Filename: from .zsync, then basename of URL)")
-		quiet    = flag.Bool("q", false, "quiet: suppress progress output")
+		seedPath string
+		outPath  string
+		quiet    bool
 	)
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: gozsync [-i seed] [-o out] [-q] <zsync-url-or-file>\n\n")
-		flag.PrintDefaults()
+	cmd := &cobra.Command{
+		Use:   "gozsync [flags] <zsync-url-or-file>",
+		Short: "Reconstruct a file from a .zsync control file + an optional seed",
+		Long: `gozsync reads a .zsync control file (locally or over HTTP), reuses any
+blocks it can find in the given seed file, fetches the rest via HTTP
+Range requests against the URL embedded in the .zsync, and writes the
+reconstructed file. The on-the-wire format is byte-compatible with the
+original zsync (Colin Phipps) and AppImageCommunity/zsync2.`,
+		Args:          cobra.ExactArgs(1),
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			return run(args[0], seedPath, outPath, quiet)
+		},
 	}
-	flag.Parse()
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
-	}
-	loc := flag.Arg(0)
+	cmd.Flags().StringVarP(&seedPath, "input", "i", "", "local seed file (older version of the target) — optional")
+	cmd.Flags().StringVarP(&outPath, "output", "o", "", "output path (default: Filename: from .zsync, then basename of URL)")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress progress output")
 
+	if err := cmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "gozsync: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(loc, seedPath, outPath string, quiet bool) error {
 	cf, baseURL, err := loadControlFile(loc)
 	if err != nil {
-		die("%v", err)
+		return err
 	}
 
-	if !*quiet {
+	if !quiet {
 		fmt.Fprintf(os.Stderr, "zsync: target %q, %d blocks of %d bytes (%d bytes total)\n",
 			cf.Filename, cf.NumBlocks(), cf.Blocksize, cf.Length)
 	}
 
 	m := zsync.NewMatcher(cf)
 
-	if *seedPath != "" {
-		sf, err := os.Open(*seedPath)
+	if seedPath != "" {
+		sf, err := os.Open(seedPath)
 		if err != nil {
-			die("open seed %s: %v", *seedPath, err)
+			return fmt.Errorf("open seed %s: %w", seedPath, err)
 		}
 		t0 := time.Now()
 		err = m.FeedSeed(sf)
 		_ = sf.Close()
 		if err != nil {
-			die("feed seed: %v", err)
+			return fmt.Errorf("feed seed: %w", err)
 		}
-		if !*quiet {
+		if !quiet {
 			fmt.Fprintf(os.Stderr, "seed scan: matched %d/%d blocks in %s\n",
 				m.AcceptedBlocks(), m.TotalBlocks(), time.Since(t0).Round(time.Millisecond))
 		}
 	}
 
 	missing := m.MissingRanges()
-	if !*quiet {
+	if !quiet {
 		var missingBlocks int
 		for _, r := range missing {
 			missingBlocks += r[1] - r[0]
@@ -80,37 +95,38 @@ func main() {
 	if len(missing) > 0 {
 		targetURL, err := zsync.ResolveTargetURL(cf, baseURL)
 		if err != nil {
-			die("%v", err)
+			return err
 		}
-		if !*quiet {
+		if !quiet {
 			fmt.Fprintf(os.Stderr, "fetching from %s\n", targetURL)
 		}
 		fc := zsync.NewFetchClient()
 		if err := fc.FetchBlocks(targetURL, cf, m, missing); err != nil {
-			die("%v", err)
+			return err
 		}
 	}
 
 	if err := zsync.VerifySHA1(cf, m.Out()); err != nil {
-		die("%v", err)
+		return err
 	}
 
-	out := *outPath
+	out := outPath
 	if out == "" {
 		out = cf.Filename
 		if out == "" {
 			out = strings.TrimSuffix(filepath.Base(baseURL), ".zsync")
 		}
 		if out == "" || out == "." || out == "/" {
-			die("could not derive output filename; pass -o")
+			return fmt.Errorf("could not derive output filename; pass --output")
 		}
 	}
 	if err := os.WriteFile(out, m.Out(), 0o644); err != nil {
-		die("write %s: %v", out, err)
+		return fmt.Errorf("write %s: %w", out, err)
 	}
-	if !*quiet {
+	if !quiet {
 		fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", out, cf.Length)
 	}
+	return nil
 }
 
 func loadControlFile(loc string) (*zsync.ControlFile, string, error) {
@@ -134,8 +150,6 @@ func loadControlFile(loc string) (*zsync.ControlFile, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
-		// Pin the final URL after redirects so relative URLs in the .zsync
-		// resolve against where we actually got it from.
 		final := resp.Request.URL.String()
 		return cf, final, nil
 	}
@@ -148,16 +162,9 @@ func loadControlFile(loc string) (*zsync.ControlFile, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	// Synthesise a file:// base for relative URL resolution.
 	abs, err := filepath.Abs(loc)
 	if err != nil {
 		return nil, "", err
 	}
 	return cf, "file://" + abs, nil
 }
-
-func die(f string, a ...any) {
-	fmt.Fprintf(os.Stderr, "gozsync: "+f+"\n", a...)
-	os.Exit(1)
-}
-
