@@ -917,6 +917,18 @@ func TestFetchBlocksMultiPartBatched4xxStopsFailover(t *testing.T) {
 	}
 }
 
+// TestShouldFailoverBareError — a bare (non-*failoverError) error is
+// always treated as a transport error worth retrying. Drives the
+// `!ok` branch at fetch.go:431.
+func TestShouldFailoverBareError(t *testing.T) {
+	if !shouldFailover(io.EOF) {
+		t.Fatal("bare error should trigger failover")
+	}
+	if !shouldFailover(fmt.Errorf("synthetic transport failure")) {
+		t.Fatal("bare wrapped error should trigger failover")
+	}
+}
+
 func TestParseMultipartByteRangesBadContentRange(t *testing.T) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
