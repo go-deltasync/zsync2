@@ -2,8 +2,10 @@
 
 [![ci](https://github.com/go-deltasync/zsync2/actions/workflows/ci.yml/badge.svg)](https://github.com/go-deltasync/zsync2/actions/workflows/ci.yml)
 [![compat](https://github.com/go-deltasync/zsync2/actions/workflows/compat.yml/badge.svg)](https://github.com/go-deltasync/zsync2/actions/workflows/compat.yml)
+[![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/go-deltasync/zsync2/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/go-deltasync/zsync2.svg)](https://pkg.go.dev/github.com/go-deltasync/zsync2)
-[![License: BSD 3-Clause](https://img.shields.io/badge/license-BSD%203--Clause-blue.svg)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/go-deltasync/zsync2)](go.mod)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 
 `zsync2` is a pure-Go reimplementation of [zsync][zsync-home], the rsync-style
 delta-update protocol designed by Colin Phipps in 2005. The library lets an
