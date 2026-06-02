@@ -309,6 +309,18 @@ The `internal/zsync` package is held to **&ge;99% line coverage** by CI;
 new code should keep it there. Any change to header parsing or block-table
 serialisation must keep all four compat-test scenarios green.
 
+## Library
+
+Importable for use in other Go programs (pure Go, no cgo):
+
+```go
+import "github.com/go-deltasync/zsync2"
+
+cf, _ := zsync2.Make(target, size, blocksize, "file", mtime, urls) // build .zsync
+m := zsync2.NewMatcher(cf)
+_ = m.FeedSeed(localSeed) // reuse local blocks; fetch m.MissingRanges() over HTTP
+```
+
 ## License
 
 BSD 3-Clause. See [LICENSE](LICENSE).
