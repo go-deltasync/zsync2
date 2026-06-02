@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/go-compressions/blake3"
 	"golang.org/x/crypto/md4" //nolint:staticcheck // zsync wire format requires MD4
-	"lukechampine.com/blake3"
 )
 
 // Strong-hash algorithm identifiers used inside ControlFile and on the wire
@@ -79,7 +79,7 @@ type blake3Hasher interface {
 // blake3New returns a streaming BLAKE3-256 hasher. Used to compute the
 // file-wide File-Hash: BLAKE3:<hex> digest as Make consumes its input.
 func blake3New() blake3Hasher {
-	return blake3.New(32, nil)
+	return blake3.New()
 }
 
 // strongHash returns the full strong-hash digest of blk under the given
