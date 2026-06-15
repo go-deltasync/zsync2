@@ -10,14 +10,18 @@ permissions:
   contents: read
 
 jobs:
+  # Native runners. amd64 (ubuntu-latest) and arm64 (ubuntu-24.04-arm) run the
+  # full suite with the race detector and gate internal/zsync at 100% Go-statement
+  # coverage — the same gate the single-arch CI enforced, now on two real arches.
   test:
-    name: test (${{ matrix.os }} / go${{ matrix.go }})
+    name: test (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        go: ["1.22", "1.23"]
+        include:
+          - { os: ubuntu-latest, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,8 +29,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go }}
-          check-latest: true
+          go-version: stable
 
       - name: Show Go version
         run: go version
@@ -38,24 +41,75 @@ jobs:
         run: go build ./...
 
       - name: Test
-        shell: bash
+        run: go test -race -coverprofile=cover.out ./...
+
+      - name: Coverage gate (internal/zsync 100%)
         run: |
-          go test -race -coverprofile=cover.out ./...
-          go tool cover -func=cover.out | tee cover.txt
-          # The CLIs in cmd/ are thin wrappers around the internal package
-          # and intentionally have no unit tests; we enforce 100% coverage
-          # on the library (internal/zsync) only, which is where the
-          # protocol-correctness logic lives.
-          pkg_cov=$(go test -coverprofile=cover-pkg.out ./internal/zsync >/dev/null 2>&1 && \
-                    go tool cover -func=cover-pkg.out | tail -n 1 | awk '{print $3}' | tr -d '%')
-          echo "internal/zsync coverage: ${pkg_cov}%"
-          awk -v t="$pkg_cov" 'BEGIN { exit !(t+0 >= 100.0) }' || {
-            echo "::error::internal/zsync coverage ${pkg_cov}% < 100%"; exit 1; }
+          # The CLIs in cmd/ are thin wrappers around the internal package and
+          # intentionally have no unit tests; we enforce 100% coverage on the
+          # library (internal/zsync) only, which is where the protocol-correctness
+          # logic — rolling checksums, .zsync binary metadata — lives.
+          go test -covermode=atomic -coverprofile=cover-pkg.out ./internal/zsync >/dev/null
+          go tool cover -func=cover-pkg.out | tail -n 5
+          pct=$(go tool cover -func=cover-pkg.out | awk '/^total:/{print $3}' | tr -d '%')
+          echo "internal/zsync coverage: ${pct}%"
+          awk -v t="$pct" 'BEGIN { exit !(t+0 >= 100.0) }' || {
+            echo "::error::internal/zsync coverage ${pct}% < 100%"; exit 1; }
 
       - name: Upload coverage profile
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cover-${{ matrix.os }}-go${{ matrix.go }}
+          name: cover-${{ matrix.arch }}
           path: cover.out
           if-no-files-found: warn
+
+  # Emulated 64-bit arches under QEMU. zsync2 is the zsync delta format — rolling
+  # weak checksums and a binary .zsync control file written big-endian on the wire
+  # (encoding/binary.BigEndian throughout, fixed-width uint16/uint32 arithmetic,
+  # no unsafe / NativeEndian). s390x is therefore a genuine big-endian acid test
+  # of the protocol codec, not a formality. We cross-compile a coverage-instrumented
+  # test binary for internal/zsync (CGO disabled), run it under QEMU, and apply the
+  # same 100% gate. No fuzzing under QEMU-TCG (flaky toolchain/TCG interaction, not
+  # a kernel concern here). qemu cpu models match the green go-simd matrix:
+  #   riscv64 rv64,v=true,vlen=128 · loong64 la464 · ppc64le power9 · s390x default.
+  emulated:
+    name: emulated (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: riscv64, image: "debian:trixie", qemu: "rv64,v=true,vlen=128" }
+          - { arch: loong64, image: "ghcr.io/loong64/debian:trixie", qemu: "la464" }
+          - { arch: ppc64le, image: "debian:trixie", qemu: "power9" }
+          - { arch: s390x,   image: "debian:trixie", qemu: "qemu" }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install QEMU binfmt handlers
+        run: docker run --privileged --rm tonistiigi/binfmt --install ${{ matrix.arch }}
+
+      - name: Cross-compile internal/zsync cover test binary
+        run: |
+          GOOS=linux GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
+            go test -covermode=atomic -coverpkg=./internal/zsync \
+            -c -o /tmp/cov.test ./internal/zsync
+
+      - name: Run under QEMU and gate (internal/zsync 100%)
+        run: |
+          docker run --rm --platform linux/${{ matrix.arch }} \
+            -e QEMU_CPU=${{ matrix.qemu }} \
+            -v /tmp:/t ${{ matrix.image }} \
+            /t/cov.test -test.v -test.coverprofile=/t/cov.out
+          go tool cover -func=/tmp/cov.out | tail -n 5
+          pct=$(go tool cover -func=/tmp/cov.out | awk '/^total:/{print $3}' | tr -d '%')
+          echo "internal/zsync coverage (${{ matrix.arch }}): ${pct}%"
+          awk -v t="$pct" 'BEGIN { exit !(t+0 >= 100.0) }' || {
+            echo "::error::internal/zsync coverage ${pct}% < 100% on ${{ matrix.arch }}"; exit 1; }
