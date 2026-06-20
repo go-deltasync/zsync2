@@ -92,18 +92,9 @@ func run(loc, seedPath, outPath string, quiet bool) error {
 
 	// Resolve output path early — both the resume-from-.partial seed step
 	// and the final write need it.
-	out := outPath
-	if out == "" {
-		out = cf.Filename
-		if out == "" {
-			base := filepath.Base(baseURL)
-			base = strings.TrimSuffix(base, ".zsync2")
-			base = strings.TrimSuffix(base, ".zsync")
-			out = base
-		}
-		if out == "" || out == "." || out == "/" {
-			return fmt.Errorf("could not derive output filename; pass --output")
-		}
+	out, err := deriveOutputName(outPath, cf.Filename, baseURL)
+	if err != nil {
+		return err
 	}
 
 	// Order of seeds: the explicit --input first, then any stale <out>.partial
@@ -237,4 +228,29 @@ func loadControlFile(loc string, ifModSince time.Time) (*zsync.ControlFile, stri
 		return nil, "", err
 	}
 	return cf, "file://" + abs, nil
+}
+
+// deriveOutputName resolves the download's output path. An explicit --output is
+// honoured verbatim (the operator's own choice). Otherwise the name is taken
+// from the UNTRUSTED .zsync control file's Filename header (falling back to the
+// URL basename) and reduced to a single path component, so a malicious control
+// file cannot set Filename to "../../etc/x" or "/abs/path" and have gozsync
+// write (and create <name>.partial) outside the working directory.
+func deriveOutputName(explicit, controlFilename, baseURL string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	out := controlFilename
+	if out == "" {
+		base := filepath.Base(baseURL)
+		base = strings.TrimSuffix(base, ".zsync2")
+		base = strings.TrimSuffix(base, ".zsync")
+		out = base
+	}
+	// Strip any directory components from the untrusted name.
+	out = filepath.Base(filepath.Clean(out))
+	if out == "" || out == "." || out == ".." || out == string(filepath.Separator) {
+		return "", fmt.Errorf("could not derive a safe output filename; pass --output")
+	}
+	return out, nil
 }
