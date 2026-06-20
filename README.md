@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-deltasync/brand/main/social/go-deltasync.png" alt="go-deltasync/zsync2" width="720"></p>
+
 # zsync2
 
 [![ci](https://github.com/go-deltasync/zsync2/actions/workflows/ci.yml/badge.svg)](https://github.com/go-deltasync/zsync2/actions/workflows/ci.yml)
