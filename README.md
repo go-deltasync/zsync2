@@ -202,7 +202,10 @@ The codebase intentionally avoids any system-specific dependency:
 - **No platform-conditional files.** Every `.go` source in this repo
   compiles on every supported `GOOS`/`GOARCH` combination.
 
-Tested matrix in CI: `linux`, `macos`, `windows` × `go 1.22`, `go 1.23`.
+Tested matrix in CI (Go `stable`): `linux/amd64` and `linux/arm64` on native
+runners, plus `riscv64`, `loong64`, `ppc64le` and `s390x` (big-endian) under
+QEMU — all six 64-bit Go targets, each running the full race-enabled suite and
+the 100% coverage gate on `internal/zsync`.
 
 ## Compatibility with upstream zsync / zsync2
 
@@ -307,8 +310,8 @@ go test -race ./...
 go test -tags=compat ./...   # requires `zsync` from apt / brew / pkgsrc
 ```
 
-The `internal/zsync` package is held to **&ge;99% line coverage** by CI;
-new code should keep it there. Any change to header parsing or block-table
+The `internal/zsync` package is held to **100% statement coverage** by CI
+(the org-wide gate); new code should keep it there. Any change to header parsing or block-table
 serialisation must keep all four compat-test scenarios green.
 
 ## Library
