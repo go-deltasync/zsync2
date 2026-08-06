@@ -1,6 +1,6 @@
 module github.com/go-deltasync/zsync2
 
-go 1.22
+go 1.26.4
 
 require (
 	github.com/go-compressions/blake3 v0.2.0
