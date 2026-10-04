@@ -814,13 +814,13 @@ func TestWalkerDynamicLensCode16NoPrevious(t *testing.T) {
 			bits = append(bits, (v>>i)&1)
 		}
 	}
-	push(0, 5)  // HLIT
-	push(0, 5)  // HDIST
-	push(0, 4)  // HCLEN
-	push(1, 3)  // CL[16] = 1
-	push(0, 3)  // CL[17] = 0
-	push(0, 3)  // CL[18] = 0
-	push(1, 3)  // CL[0]  = 1
+	push(0, 5) // HLIT
+	push(0, 5) // HDIST
+	push(0, 4) // HCLEN
+	push(1, 3) // CL[16] = 1
+	push(0, 3) // CL[17] = 0
+	push(0, 3) // CL[18] = 0
+	push(1, 3) // CL[0]  = 1
 	// First code-length symbol: read a single bit "0" → maps to sym 16.
 	push(0, 1)
 	// Pack bits into bytes.
@@ -1103,14 +1103,14 @@ func TestWalkerDynamicLensCode16ReadError(t *testing.T) {
 	// last byte), making Read(2) try to fetch another byte that isn't
 	// there. Adjust CL widths.
 	bits = nil
-	push(0, 5)  // HLIT  (bit 0..4)
-	push(0, 5)  // HDIST (bit 5..9)
-	push(0, 4)  // HCLEN (bit 10..13)
+	push(0, 5) // HLIT  (bit 0..4)
+	push(0, 5) // HDIST (bit 5..9)
+	push(0, 4) // HCLEN (bit 10..13)
 	// 14 bits used; 18 bits remain in 32-bit budget.
-	push(1, 3)  // CL[16] = 1 (bit 14..16)
+	push(1, 3) // CL[16] = 1 (bit 14..16)
 	push(0, 3)
 	push(0, 3)
-	push(1, 3)  // CL[0]  = 1 (bit 23..25)
+	push(1, 3) // CL[0]  = 1 (bit 23..25)
 	// 26 bits used. lit-len CL stream reads sym-by-sym; we want sym 16
 	// to be the LAST bit consumed before EOF.
 	push(1, 1) // sym 0 → lens[0]=0 (bit 26)
@@ -1243,13 +1243,13 @@ func TestWalkerDynamicLensCode16Overruns(t *testing.T) {
 			bits = append(bits, (v>>i)&1)
 		}
 	}
-	push(0, 5)  // HLIT=0
-	push(0, 5)  // HDIST=0
-	push(0, 4)  // HCLEN=0 → 4 CL codes
-	push(1, 3)  // CL[16] = 1
+	push(0, 5) // HLIT=0
+	push(0, 5) // HDIST=0
+	push(0, 4) // HCLEN=0 → 4 CL codes
+	push(1, 3) // CL[16] = 1
 	push(0, 3)
 	push(0, 3)
-	push(1, 3)  // CL[0]  = 1
+	push(1, 3) // CL[0]  = 1
 	// buildCanonicalCode orders symbols by index within a length bucket:
 	// at length 1, syms = [0, 16], so bit "0" → sym 0, bit "1" → sym 16.
 	// We want 257 syms of "0" (=sym 0), then a "1" (=sym 16), then extras.
@@ -1364,13 +1364,13 @@ func TestWalkerDynamicLensCode17OverrunsTable(t *testing.T) {
 			bits = append(bits, (v>>i)&1)
 		}
 	}
-	push(0, 5)  // HLIT=0
-	push(0, 5)  // HDIST=0
-	push(0, 4)  // HCLEN=0 → 4 CL codes
-	push(0, 3)  // CL[16]
-	push(1, 3)  // CL[17] = 1 → "1" decodes to sym 17 (sym 0 takes "0")
-	push(0, 3)  // CL[18]
-	push(1, 3)  // CL[0]  = 1
+	push(0, 5) // HLIT=0
+	push(0, 5) // HDIST=0
+	push(0, 4) // HCLEN=0 → 4 CL codes
+	push(0, 3) // CL[16]
+	push(1, 3) // CL[17] = 1 → "1" decodes to sym 17 (sym 0 takes "0")
+	push(0, 3) // CL[18]
+	push(1, 3) // CL[0]  = 1
 	// buildCanonicalCode buckets symbols by sym-index within a length:
 	// at length 1, syms = [0, 17] → bit "0" = sym 0, bit "1" = sym 17.
 	// 26 × (sym 17 = "1" + 3 extras "111") = 26 × 4 bits = 104 bits.

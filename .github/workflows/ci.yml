@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        go: ["1.22", "1.23"]
+        go: ["1.27.1"]
         # ⛔ macOS + Go 1.22 cannot LINK this module's tests any more, and has
         # not since at least 2026-08-27. dyld refuses every test binary with
         # "missing LC_UUID load command" before a single test runs.

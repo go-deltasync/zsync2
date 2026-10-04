@@ -163,8 +163,8 @@ func skipGzipHeader(r io.Reader) (int64, error) {
 type bitReader struct {
 	r       io.Reader
 	buf     uint64
-	bits    uint // number of valid bits in buf
-	bytePos int64 // absolute byte position into the deflate stream
+	bits    uint   // number of valid bits in buf
+	bytePos int64  // absolute byte position into the deflate stream
 	bitPos  uint64 // absolute bit position into the deflate stream
 	err     error
 }

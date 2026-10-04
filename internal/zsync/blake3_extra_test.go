@@ -49,4 +49,3 @@ func TestVerifyFileHashEmptyAlgoDefaultsToMD4(t *testing.T) {
 		t.Fatal("expected mismatch on empty-algo MD4 path")
 	}
 }
-
