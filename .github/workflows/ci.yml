@@ -39,11 +39,17 @@ jobs:
         # `-ldflags=-linkmode=internal` does not help: with cgo present it falls
         # straight back to external, which is how it was mistaken for a fix.
         #
-        # 1.22 is the floor go.mod declares and it stays tested — on ubuntu and
-        # windows, where it passes. Only this one cell is excluded.
-        exclude:
-          - os: macos-latest
-            go: "1.22"
+        # ⚠ The paragraph above is HISTORY as of #8, which raised the floor to
+        # 1.27.1. It used to end "1.22 is the floor go.mod declares and it stays
+        # tested — on ubuntu and windows, where it passes", and both halves of
+        # that stopped being true the moment the directive moved: go.mod no
+        # longer declares 1.22, and the matrix no longer runs it anywhere. The
+        # `exclude:` that went with it named a cell the matrix no longer
+        # produces, so it was removed rather than left to look like a live rule.
+        #
+        # The finding itself is kept because it costs nothing and is hard-won:
+        # should the floor ever go back below 1.23, macOS will need that cell
+        # excluded again, for the reason set out above.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -53,6 +59,16 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
+
+      # Without this the matrix cannot be wrong, because go satisfies a
+      # directive it is too old for by DOWNLOADING a newer toolchain -- the leg
+      # keeps printing the version it asked for while running another one.
+      # Measured in the sibling repository go-deltasync/rdiff, whose job named
+      # "test (macos-latest / go1.22)" printed "Setup go version spec 1.22"
+      # and then "go version go1.27.1". With GOTOOLCHAIN=local a leg below the
+      # directive fails outright instead.
+      - name: Refuse a toolchain other than the one this leg asked for
+        run: echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
 
       - name: Show Go version
         run: go version
